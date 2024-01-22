@@ -303,7 +303,7 @@ class PDS(object):
         noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        w = 1 - scheduler.alphas_cumprod[t]
+        w = 1 - scheduler.alphas_cumprod[t].to(device)
         grad = w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
         target = (im - grad).detach()
