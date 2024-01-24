@@ -280,6 +280,8 @@ class PDS(object):
         prompt=None,
         skip_percentage=0.5,
         num_solve_steps=20,
+        src_cfg_scale=100,
+        tgt_cfg_scale=100,
         reduction="mean",
         return_dict=False,
     ):
@@ -317,8 +319,8 @@ class PDS(object):
         noise_t_prev = torch.randn_like(tgt_x0)
 
         zts = dict()
-        for latent, cond_text_embedding, name in zip(
-            [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"]
+        for latent, cond_text_embedding, name, cfg_scale in zip(
+            [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"], [tgt_cfg_scale, src_cfg_scale]
         ):
             latents_noisy = scheduler.add_noise(latent, noise, t)
             latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
@@ -329,7 +331,7 @@ class PDS(object):
                 encoder_hidden_states=text_embeddings,
             ).sample
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
 
             x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
             mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
@@ -416,7 +418,7 @@ class PDS(object):
             ).sample
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             # noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            noise_pred = noise_pred_uncond + 7.5 * (noise_pred_text - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + 15 * (noise_pred_text - noise_pred_uncond)
             xt = self.reverse_step(noise_pred, t, xt, eta=eta)
 
         return xt
