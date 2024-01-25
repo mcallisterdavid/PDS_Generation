@@ -8,3 +8,5 @@ data/*
 *.swp
 **/outputs/
 **/data/
+results/
+local_scripts/

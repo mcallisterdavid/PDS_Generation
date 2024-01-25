@@ -302,12 +302,6 @@ class PDS(object):
             skip=int(skip_percentage * num_solve_steps),
         )
 
-        # Save debug image for SDEdit result
-        if torch.rand(1).item() > 0.7:
-            x0_decoded = self.decode_latent(src_x0).squeeze().permute(1, 2, 0).cpu().numpy()
-            plt.imsave('./sdedit_debug.png', x0_decoded)
-
-
         batch_size = im.shape[0]
         t, t_prev = self.pds_timestep_sampling(batch_size)
         beta_t = scheduler.betas[t].to(device)
@@ -343,7 +337,7 @@ class PDS(object):
         target = (tgt_x0 - grad).detach()
         loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size
         if return_dict:
-            dic = {"loss": loss, "grad": grad, "t": t}
+            dic = {"loss": loss, "grad": grad, "t": t, "src_x0": src_x0}
             return dic
         else:
             return loss
