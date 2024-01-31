@@ -11,6 +11,7 @@ import math
 from tqdm import tqdm
 import mediapy
 import imageio
+from utils.imageutil import gaussian_blur, gaussian_kernel
 
 from diffusers import DDIMPipeline, DDIMScheduler, DDPMPipeline, DDPMScheduler, StableDiffusionPipeline
 from typing import *
@@ -31,21 +32,35 @@ def seed_everything(seed):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--prompt', type=str, default='a DSLR photo of a dog in a winter wonderland')
+parser.add_argument('--init_image_fn', type=str, default=None)
 parser.add_argument('--skip_percentage', type=float, default=0.8)
 parser.add_argument('--num_solve_steps', type=int, default=32)
 parser.add_argument('--guidance_scale', type=float, default=100)
 parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--n_steps', type=int, default=2000)
+parser.add_argument('--n_steps', type=int, default=3000)
 args = parser.parse_args()
+
+init_image_fn = args.init_image_fn
 
 pds = PDS(PDSConfig(
     sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base'
 ))
 
-reference = torch.tensor(plt.imread('./pds/base.png'))
-reference = reference[..., :3].permute(2, 0, 1)[None, ...]
-reference = reference.to(pds.unet.device)
+# Blur logic
+# kernel_size = 10
+# sigma = 3.2
+# im = gaussian_blur(im, kernel_size, sigma)
+
+if init_image_fn is not None:
+    reference = torch.tensor(plt.imread(init_image_fn))[..., :3]
+    reference = reference.permute(2, 0, 1)[None, ...]
+    reference = reference.to(pds.unet.device)
+
+    reference_latent = pds.encode_image(reference)
+    im = reference_latent
+else:
+    im = torch.randn((1, 4, 64, 64), device=pds.unet.device)
 
 save_dir = 'results/pds_gen_sde_edit/%s_lr%.3f_seed%d' % (args.prompt.replace(' ', '_'), args.lr, args.seed)
 os.makedirs(save_dir, exist_ok=True)
@@ -61,13 +76,10 @@ def decode_latent(latent):
     rgb = rgb.flatten(start_dim=1, end_dim=2)
     return rgb
 
-reference_latent = pds.encode_image(reference)
-decoded = decode_latent(reference_latent)
 
 # PDS + SDEdit Generation
 batch_size = 1
 
-im = 0.8 * torch.randn_like(reference_latent.repeat(batch_size, 1, 1, 1))
 im.requires_grad_(True)
 im.retain_grad()
 
@@ -78,13 +90,20 @@ decodes_src = []
 for step in tqdm(range(args.n_steps)):
     im_optimizer.zero_grad()
 
+    if init_image_fn is None:
+        # A (generation)
+        skip_percentage = min(step / 1400, 0.97)
+    else:
+        # B (projection to manifold)
+        skip_percentage = 0.97
+
     with torch.no_grad():
         pds.config.guidance_scale = args.guidance_scale
         pds_dict = pds.pds_gen_sdedit_src(
             im=im,
             prompt=args.prompt,
-            # skip_percentage = 0., # not converage
-            skip_percentage = min(step / 1000, 0.8),
+            src_method="step",
+            skip_percentage = skip_percentage,
             num_solve_steps = 12 + min(step // 200, 20),
             return_dict=True
         )

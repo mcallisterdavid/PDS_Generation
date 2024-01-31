@@ -1,7 +1,62 @@
 from typing import List
 
 from PIL import Image
+import torch
+import torch.nn.functional as F
 
+def clip_image_at_percentiles(image, lower_percentile, upper_percentile):
+    """
+    Clips the image at the given lower and upper percentiles.
+    """
+    # Flatten the image to compute percentiles
+    flattened_image = image.flatten()
+
+    # Compute the lower and upper bounds
+    lower_bound = torch.quantile(flattened_image, lower_percentile)
+    upper_bound = torch.quantile(flattened_image, upper_percentile)
+
+    # Clip the image
+    clipped_image = torch.clamp(image, lower_bound, upper_bound)
+
+    return clipped_image
+
+def gaussian_kernel(size, sigma):
+    """
+    Creates a Gaussian Kernel with the given size and sigma
+    """
+    # Create a tensor with coordinates of a grid
+    x = torch.arange(size).float() - size // 2
+    y = torch.arange(size).float() - size // 2
+    y, x = torch.meshgrid(y, x)
+
+    # Calculate the gaussian kernel
+    gaussian_kernel = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
+
+    # Normalize the kernel so the sum is 1
+    gaussian_kernel /= gaussian_kernel.sum()
+
+    return gaussian_kernel.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+
+def gaussian_blur(image, kernel_size, sigma):
+    """
+    Applies Gaussian Blur to the given image using the specified kernel size and sigma
+    """
+
+    image = image.permute(2, 0, 1)
+
+    # Create the kernel
+    kernel = gaussian_kernel(kernel_size, sigma)
+
+    # Repeat the kernel for each channel of the image
+    kernel = kernel.repeat(image.size(0), 1, 1, 1)
+
+    # Apply padding
+    padding = kernel_size // 2
+
+    # Apply the gaussian kernel, assuming the image is in 'channels first' format
+    blurred_image = F.conv2d(image.unsqueeze(0), kernel, padding=padding, groups=image.size(0))
+
+    return blurred_image.squeeze(0).permute(1, 2, 0)
 
 def stack_images_horizontally(images: List, save_path=None):
     widths, heights = list(zip(*(i.size for i in images)))

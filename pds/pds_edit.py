@@ -18,8 +18,8 @@ from jaxtyping import *
 from pds import PDS, PDSConfig
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--src_prompt', type=str, default='a blurry, low-res image')
-parser.add_argument('--tgt_prompt', type=str, default='a high-quality, high resolution, DSLR photo')
+parser.add_argument('--src_prompt', type=str, default='a pixelated, blurry, noisy, malformed, low-res image of a bedroom')
+parser.add_argument('--tgt_prompt', type=str, default='a high-quality, high resolution, DSLR photo of a bedroom')
 parser.add_argument('--src_image', type=str, default='./results/pds_gen_sde_edit/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.100_seed0/pds_gen_sdedit_debug_bak.png')
 parser.add_argument('--guidance_scale', type=float, default=100)
 parser.add_argument('--lr', type=float, default=0.01)
@@ -62,7 +62,8 @@ for step in tqdm(range(args.n_steps)):
     with torch.no_grad():
         pds_dict = pds(
             tgt_x0=im,
-            src_x0=reference_latent.clone(),
+            src_x0=reference_latent.clone(), # Normal PDS
+            # src_x0=im.clone(), # src and tgt are same
             tgt_prompt=args.tgt_prompt,
             src_prompt=args.src_prompt,
             return_dict=True

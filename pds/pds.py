@@ -5,9 +5,10 @@ import torch
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
+from typing import Literal
 from PIL import Image
 import matplotlib.pyplot as plt
-
+from utils.imageutil import clip_image_at_percentiles
 
 @dataclass
 class PDSConfig:
@@ -21,6 +22,7 @@ class PDSConfig:
     tgt_prompt: str = "a photo of a man raising his arms"
 
     guidance_scale: float = 100
+    sdedit_guidance_scale: float = 15
     device: torch.device = torch.device("cuda")
 
 
@@ -282,6 +284,7 @@ class PDS(object):
         num_solve_steps=20,
         src_cfg_scale=100,
         tgt_cfg_scale=100,
+        src_method: Literal["sdedit", "step"] = "sdedit",
         reduction="mean",
         return_dict=False,
     ):
@@ -289,18 +292,28 @@ class PDS(object):
         scheduler = self.scheduler
 
         # process text.
-        self.update_text_features(tgt_prompt=prompt)
+        self.update_text_features(tgt_prompt=prompt + ', detailed, high resolution, high quality, sharp', src_prompt=prompt + ', pixelated, foggy, hazy, blurry, noisy, malformed')
         tgt_text_embedding = self.tgt_text_feature
-        src_text_embedding = self.tgt_text_feature
+        src_text_embedding = self.src_text_feature
         uncond_embedding = self.null_text_feature
 
         tgt_x0 = im
-        src_x0 = self.run_sdedit(
-            x0=im,
-            tgt_prompt=prompt,
-            num_inference_steps=num_solve_steps,
-            skip=int(skip_percentage * num_solve_steps),
-        )
+
+        if src_method == "sdedit":
+            src_x0 = self.run_sdedit(
+                x0=im,
+                tgt_prompt=prompt,
+                num_inference_steps=num_solve_steps,
+                skip=int(skip_percentage * num_solve_steps),
+            )
+        elif src_method == "step":
+            lower_bound =  999 - int(skip_percentage * 1000)
+            upper_bound = 1000 - int(skip_percentage * 950)
+            src_x0 = self.run_single_step(
+                x0=im,
+                t = torch.randint(lower_bound, upper_bound, size=(1,)).item(),
+                tgt_prompt=prompt,
+            )
 
         batch_size = im.shape[0]
         t, t_prev = self.pds_timestep_sampling(batch_size)
@@ -412,22 +425,55 @@ class PDS(object):
             ).sample
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             # noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            noise_pred = noise_pred_uncond + 15 * (noise_pred_text - noise_pred_uncond)
-            xt = self.reverse_step(noise_pred, t, xt, eta=eta)
+            noise_pred = noise_pred_uncond + self.config.sdedit_guidance_scale * (noise_pred_text - noise_pred_uncond)
+            xt = self.reverse_step(noise_pred, t, xt, eta=eta, scheduler=scheduler)
 
         return xt
 
-    def reverse_step(self, model_output, timestep, sample, eta=0, variance_noise=None):
-        prev_timestep = timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
-        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+    def run_single_step(self, x0, t: int, tgt_prompt=None, percentile_clip=False, eta=0):
+        scheduler = self.scheduler
+
+        t = torch.tensor(t, device=x0.device)
+        noise = torch.randn_like(x0)
+
+        xt = scheduler.add_noise(x0, noise, t)
+
+        self.update_text_features(None, tgt_prompt=tgt_prompt)
+        tgt_text_embedding = self.tgt_text_feature
+        null_text_embedding = self.null_text_feature
+        text_embeddings = torch.cat([tgt_text_embedding, null_text_embedding], dim=0)
+
+        xt_input = torch.cat([xt] * 2)
+        noise_pred = self.unet.forward(
+            xt_input,
+            torch.cat([t[None]] * 2).to(self.device),
+            encoder_hidden_states=text_embeddings,
+        ).sample
+        noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + self.config.sdedit_guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        xhat_pred = self.scheduler.step(noise_pred, t, xt, eta=eta).pred_original_sample
+
+        if percentile_clip:
+            xhat_pred = clip_image_at_percentiles(xhat_pred, 0.05, 0.95)
+
+        return xhat_pred
+
+    def reverse_step(self, model_output, timestep, sample, eta=0, variance_noise=None, scheduler=None):
+
+        if scheduler is None:
+            scheduler = self.scheduler
+
+        prev_timestep = timestep - scheduler.config.num_train_timesteps // scheduler.num_inference_steps
+        alpha_prod_t = scheduler.alphas_cumprod[timestep]
         alpha_prod_t_prev = (
-            self.scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod
+            scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else scheduler.final_alpha_cumprod
         )
         beta_prod_t = 1 - alpha_prod_t
 
         pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
 
-        variance = self.get_variance(timestep)
+        variance = self.get_variance(timestep, scheduler)
         model_output_direction = model_output
         pred_sample_direction = (1 - alpha_prod_t_prev - eta * variance) ** (0.5) * model_output_direction
         prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
@@ -438,11 +484,15 @@ class PDS(object):
             prev_sample = prev_sample + sigma_z
         return prev_sample
 
-    def get_variance(self, timestep):
-        prev_timestep = timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+    def get_variance(self, timestep, scheduler=None):
+
+        if scheduler is None:
+            scheduler = self.scheduler
+
+        prev_timestep = timestep - scheduler.config.num_train_timesteps // scheduler.num_inference_steps
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         alpha_prod_t_prev = (
-            self.scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod
+            scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else scheduler.final_alpha_cumprod
         )
         beta_prod_t = 1 - alpha_prod_t
         beta_prod_t_prev = 1 - alpha_prod_t_prev
