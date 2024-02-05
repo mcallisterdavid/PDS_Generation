@@ -58,7 +58,7 @@ if init_image_fn is not None:
     reference = reference.to(pds.unet.device)
 
     reference_latent = pds.encode_image(reference)
-    im = reference_latent
+    im = reference_latent.clone()
 else:
     im = torch.randn((1, 4, 64, 64), device=pds.unet.device)
 
@@ -107,11 +107,22 @@ for step in tqdm(range(args.n_steps)):
             num_solve_steps = 12 + min(step // 200, 20),
             return_dict=True
         )
+
+        # pds_dict = pds.sds_loss(
+        #     im=im,
+        #     prompt=args.prompt,
+        #     return_dict=True,
+        # )
     grad = pds_dict['grad']
     src_x0 = pds_dict['src_x0']
 
     # loss.backward()
     im.backward(gradient=grad)
+
+    if init_image_fn is not None:
+        reconstruction_loss = F.mse_loss(im, reference_latent.clone()) * 1e0 * 4 # basically disabled, high CFG gradient dominates
+        reconstruction_loss.backward()
+
     im_optimizer.step()
 
     if step % 10 == 0:
