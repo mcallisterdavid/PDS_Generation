@@ -292,7 +292,8 @@ class PDS(object):
         scheduler = self.scheduler
 
         # process text.
-        self.update_text_features(tgt_prompt=prompt + ', detailed, high resolution, high quality, sharp', src_prompt=prompt + ', pixelated, foggy, hazy, blurry, noisy, malformed')
+        self.update_text_features(tgt_prompt=prompt + ', detailed high resolution, high quality, sharp', src_prompt=prompt + ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed')
+        # self.update_text_features(tgt_prompt=prompt + ', detailed, high resolution, high quality, sharp', src_prompt=prompt)
         tgt_text_embedding = self.tgt_text_feature
         src_text_embedding = self.src_text_feature
         uncond_embedding = self.null_text_feature
@@ -307,8 +308,9 @@ class PDS(object):
                 skip=int(skip_percentage * num_solve_steps),
             )
         elif src_method == "step":
-            lower_bound =  999 - int(skip_percentage * 1000)
-            upper_bound = 1000 - int(skip_percentage * 950)
+            # lower_bound =  999 - int(skip_percentage * 1000)
+            lower_bound = 30
+            upper_bound = 1000 - int(skip_percentage * 970)
             src_x0 = self.run_single_step(
                 x0=im,
                 t = torch.randint(lower_bound, upper_bound, size=(1,)).item(),
@@ -339,6 +341,20 @@ class PDS(object):
             ).sample
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
+
+            scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(latents_noisy)
+            latent_clean_pred = scheduler.step(noise_pred, t, latents_noisy).pred_original_sample
+
+            clean_pred = self.vae.decode(latent_clean_pred / 0.18215).sample
+            clean_pred = (clean_pred / 2 + 0.5)
+            clean_pred = clip_image_at_percentiles(clean_pred, 0.03, 0.97)
+            clean_pred -= clean_pred.min()
+            clean_pred /= clean_pred.max()
+            clipped_latent_clean = self.encode_image(clean_pred)
+
+            alpha_prod_t = scheduler.alphas_cumprod[t]
+            beta_prod_t = 1 - alpha_prod_t
+            noise_pred = (latents_noisy - clipped_latent_clean * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
 
             x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
             mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
