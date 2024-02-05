@@ -18,6 +18,7 @@ from typing import *
 from jaxtyping import *
 
 from pds import PDS, PDSConfig
+from pds_sdxl import PDS_sdxl, PDS_sdxlConfig
 
 from datetime import datetime
 
@@ -39,13 +40,21 @@ parser.add_argument('--guidance_scale', type=float, default=100)
 parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--n_steps', type=int, default=3000)
+parser.add_argument('--model', type=str, default='sd', choices=['sd', 'sdxl'])
 args = parser.parse_args()
 
 init_image_fn = args.init_image_fn
 
-pds = PDS(PDSConfig(
-    sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base'
-))
+if args.model == 'sd':
+    pds = PDS(PDSConfig(
+        sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base'
+    ))
+    latent_dim = 64
+else:
+    pds = PDS_sdxl(PDS_sdxlConfig(
+        sd_pretrained_model_or_path="stabilityai/stable-diffusion-xl-base-1.0"
+    ))
+    latent_dim = 128
 
 # Blur logic
 # kernel_size = 10
@@ -60,9 +69,9 @@ if init_image_fn is not None:
     reference_latent = pds.encode_image(reference)
     im = reference_latent
 else:
-    im = torch.randn((1, 4, 64, 64), device=pds.unet.device)
+    im = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
 
-save_dir = 'results/pds_gen_sde_edit/%s_lr%.3f_seed%d' % (args.prompt.replace(' ', '_'), args.lr, args.seed)
+save_dir = 'results/%s_pds_gen_sde_edit/%s_lr%.3f_seed%d' % (args.model, args.prompt.replace(' ', '_'), args.lr, args.seed)
 os.makedirs(save_dir, exist_ok=True)
 
 seed_everything(args.seed)
@@ -102,7 +111,7 @@ for step in tqdm(range(args.n_steps)):
         pds_dict = pds.pds_gen_sdedit_src(
             im=im,
             prompt=args.prompt,
-            src_method="step",
+            src_method="sdedit",
             skip_percentage = skip_percentage,
             num_solve_steps = 12 + min(step // 200, 20),
             return_dict=True
