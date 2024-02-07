@@ -4,6 +4,13 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
+def permute_decoded_latent(decoded):
+    rgb = decoded.detach()
+    rgb = rgb.float().cpu().permute(0, 2, 3, 1)
+    rgb = rgb.permute(1, 0, 2, 3)
+    rgb = rgb.flatten(start_dim=1, end_dim=2)
+    return rgb
+
 def clip_image_at_percentiles(image, lower_percentile, upper_percentile):
     """
     Clips the image at the given lower and upper percentiles.

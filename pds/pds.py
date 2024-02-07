@@ -111,24 +111,38 @@ class PDS(object):
                 self.tgt_prompt = tgt_prompt
                 self.tgt_text_feature = self.encode_text(tgt_prompt)
 
-    def pds_timestep_sampling(self, batch_size):
+    def pds_timestep_sampling(
+        self,
+        batch_size,
+        sample: float=None # Range (0, 1)
+    ):
         self.scheduler.set_timesteps(self.config.num_inference_steps)
         timesteps = reversed(self.scheduler.timesteps)
 
-        min_step = 1 if self.config.min_step_ratio <= 0 else int(len(timesteps) * self.config.min_step_ratio)
-        max_step = (
-            len(timesteps) if self.config.max_step_ratio >= 1 else int(len(timesteps) * self.config.max_step_ratio)
-        )
-        max_step = max(max_step, min_step + 1)
-        idx = torch.randint(
-            min_step,
-            max_step,
-            [batch_size],
-            dtype=torch.long,
-            device="cpu",
-        )
-        t = timesteps[idx].cpu()
-        t_prev = timesteps[idx - 1].cpu()
+        if sample is None:
+            min_step = 1 if self.config.min_step_ratio <= 0 else int(len(timesteps) * self.config.min_step_ratio)
+            max_step = (
+                len(timesteps) if self.config.max_step_ratio >= 1 else int(len(timesteps) * self.config.max_step_ratio)
+            )
+            max_step = max(max_step, min_step + 1)
+            idx = torch.randint(
+                min_step,
+                max_step,
+                [batch_size],
+                dtype=torch.long,
+                device="cpu",
+            )
+        else:
+            assert sample < 1 + 1e-6
+            assert sample > 0 - 1e-6
+            idx = torch.tensor(
+                [int(len(timesteps) * sample)],
+                dtype=torch.long,
+                device="cpu"
+            )
+
+        t = timesteps[idx].cpu().long()
+        t_prev = timesteps[idx - 1].cpu().long()
 
         return t, t_prev
 
@@ -221,7 +235,15 @@ class PDS(object):
     def pds_gen(
         self,
         im,
+        t_project,
+        t_edit,
         prompt=None,
+        num_solve_steps=20,
+        src_cfg_scale=100,
+        tgt_cfg_scale=100,
+        extra_tgt_prompts=', detailed high resolution, high quality, sharp',
+        extra_src_prompts=', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed',
+        src_method: Literal["sdedit", "step"] = "step",
         reduction="mean",
         return_dict=False,
     ):
@@ -229,48 +251,79 @@ class PDS(object):
         scheduler = self.scheduler
 
         # process text.
-        self.update_text_features(tgt_prompt=prompt)
+        self.update_text_features(tgt_prompt=prompt + extra_tgt_prompts, src_prompt=prompt + extra_src_prompts)
         tgt_text_embedding = self.tgt_text_feature
+        src_text_embedding = self.src_text_feature
         uncond_embedding = self.null_text_feature
 
+        tgt_x0 = im
         batch_size = im.shape[0]
-        t, t_prev = self.pds_timestep_sampling(batch_size)
+
+        if src_method == "sdedit":
+            src_x0 = self.run_sdedit(
+                x0=im,
+                tgt_prompt=prompt,
+                num_inference_steps=num_solve_steps,
+                skip=int((1 - t_project) * num_solve_steps),
+            )
+        elif src_method == "step":
+
+            projection_timestep, _ = self.pds_timestep_sampling(batch_size, sample=t_project)
+            src_x0 = self.run_single_step(
+                x0=im,
+                t = projection_timestep.item(),
+                tgt_prompt=prompt,
+            )
+
+        t, t_prev = self.pds_timestep_sampling(batch_size, sample=t_edit)
         beta_t = scheduler.betas[t].to(device)
         alpha_bar_t = scheduler.alphas_cumprod[t].to(device)
         alpha_bar_t_prev = scheduler.alphas_cumprod[t_prev].to(device)
         sigma_t = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t) ** (0.5)
 
-        noise = torch.randn_like(im)
-        noise_t_prev = torch.randn_like(im)
+        noise = torch.randn_like(tgt_x0)
+        noise_t_prev = torch.randn_like(tgt_x0)
 
-        latents_noisy = scheduler.add_noise(im, noise, t)
-        latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
-        text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding] * batch_size, dim=0)
+        zts = dict()
+        for latent, cond_text_embedding, name, cfg_scale in zip(
+            [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"], [tgt_cfg_scale, src_cfg_scale]
+        ):
+            latents_noisy = scheduler.add_noise(latent, noise, t)
+            latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+            text_embeddings = torch.cat([cond_text_embedding, uncond_embedding], dim=0)
+            noise_pred = self.unet.forward(
+                latent_model_input,
+                torch.cat([t] * 2).to(device),
+                encoder_hidden_states=text_embeddings,
+            ).sample
+            noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
 
-        noise_pred = self.unet.forward(
-            latent_model_input,
-            torch.cat([t] * 2).to(device),
-            encoder_hidden_states=text_embeddings,
-        ).sample
-        noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(latents_noisy)
+            latent_clean_pred = scheduler.step(noise_pred, t, latents_noisy).pred_original_sample
 
-        x_t_prev = scheduler.add_noise(im, noise_t_prev, t_prev)
+            clean_pred = self.vae.decode(latent_clean_pred / 0.18215).sample
+            clean_pred = (clean_pred / 2 + 0.5)
+            clean_pred = clip_image_at_percentiles(clean_pred, 0.03, 0.97)
+            clean_pred -= clean_pred.min()
+            clean_pred /= clean_pred.max()
+            clipped_latent_clean = self.encode_image(clean_pred)
 
-        noise_pred_src = self.pred_for_x_hat(im, t, latents_noisy, scheduler)
+            alpha_prod_t = scheduler.alphas_cumprod[t]
+            beta_prod_t = 1 - alpha_prod_t
+            noise_pred = (latents_noisy - clipped_latent_clean * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
 
-        mu_src = self.compute_posterior_mean(latents_noisy, noise_pred_src, t, t_prev)
-        mu_tgt = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
+            x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
+            mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
+            zt = (x_t_prev - mu) / sigma_t
+            zts[name] = zt
 
-        zt_src = (x_t_prev - mu_src) / sigma_t[:, None, None, None]
-        zt_tgt = (x_t_prev - mu_tgt) / sigma_t[:, None, None, None]
-
-        grad = zt_tgt - zt_src
+        grad = zts["tgt"] - zts["src"]
         grad = torch.nan_to_num(grad)
-        target = (im - grad).detach()
-        loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size
+        target = (tgt_x0 - grad).detach()
+        loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size
         if return_dict:
-            dic = {"loss": loss, "grad": grad, "t": t}
+            dic = {"loss": loss, "grad": grad, "t": t, "src_x0": src_x0}
             return dic
         else:
             return loss
@@ -293,7 +346,6 @@ class PDS(object):
 
         # process text.
         self.update_text_features(tgt_prompt=prompt + ', detailed high resolution, high quality, sharp', src_prompt=prompt + ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed')
-        # self.update_text_features(tgt_prompt=prompt + ', detailed, high resolution, high quality, sharp', src_prompt=prompt)
         tgt_text_embedding = self.tgt_text_feature
         src_text_embedding = self.src_text_feature
         uncond_embedding = self.null_text_feature
@@ -449,7 +501,7 @@ class PDS(object):
     def run_single_step(self, x0, t: int, tgt_prompt=None, percentile_clip=False, eta=0):
         scheduler = self.scheduler
 
-        t = torch.tensor(t, device=x0.device)
+        t = torch.tensor(t, device=x0.device, dtype=torch.long)
         noise = torch.randn_like(x0)
 
         xt = scheduler.add_noise(x0, noise, t)
