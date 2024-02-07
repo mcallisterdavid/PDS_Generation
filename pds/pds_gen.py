@@ -20,10 +20,10 @@ from pds_sdxl import PDS_sdxl, PDS_sdxlConfig
 class TimestepScheduleConfig():
     mode: Literal['fixed', 'schedule'] = 'fixed'
     schedule: Optional[Literal['linear', 'cosine']] = None
-    upper_bound: int = 0.98
-    lower_bound: int = 0.03
-    upper_bound_final: Optional[int] = None
-    lower_bound_final: Optional[int] = None
+    upper_bound: float = 0.98
+    lower_bound: float = 0.03
+    upper_bound_final: Optional[float] = None
+    lower_bound_final: Optional[float] = None
     warmup_steps: Optional[int] = None
     num_steps: Optional[int] = None
 
