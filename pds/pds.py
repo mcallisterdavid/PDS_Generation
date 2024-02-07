@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
-from typing import Literal
+from typing import Literal, Optional
 from PIL import Image
 import matplotlib.pyplot as plt
 from utils.imageutil import clip_image_at_percentiles
@@ -241,6 +241,8 @@ class PDS(object):
         num_solve_steps=20,
         src_cfg_scale=100,
         tgt_cfg_scale=100,
+        thresholding: Optional[Literal['dynamic']] = None,
+        dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = None,
         extra_tgt_prompts=', detailed high resolution, high quality, sharp',
         extra_src_prompts=', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed',
         src_method: Literal["sdedit", "step"] = "step",
@@ -302,16 +304,18 @@ class PDS(object):
             scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(latents_noisy)
             latent_clean_pred = scheduler.step(noise_pred, t, latents_noisy).pred_original_sample
 
-            clean_pred = self.vae.decode(latent_clean_pred / 0.18215).sample
-            clean_pred = (clean_pred / 2 + 0.5)
-            clean_pred = clip_image_at_percentiles(clean_pred, 0.03, 0.97)
-            clean_pred -= clean_pred.min()
-            clean_pred /= clean_pred.max()
-            clipped_latent_clean = self.encode_image(clean_pred)
+            if thresholding == 'dynamic':
+                clean_pred = self.vae.decode(latent_clean_pred / 0.18215).sample
+                clean_pred = (clean_pred / 2 + 0.5)
+                low_clip, high_clip = dynamic_thresholding_cutoffs
+                clean_pred = clip_image_at_percentiles(clean_pred, low_clip, high_clip)
+                clean_pred -= clean_pred.min()
+                clean_pred /= clean_pred.max()
+                latent_clean_pred = self.encode_image(clean_pred)
 
             alpha_prod_t = scheduler.alphas_cumprod[t]
             beta_prod_t = 1 - alpha_prod_t
-            noise_pred = (latents_noisy - clipped_latent_clean * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
+            noise_pred = (latents_noisy - latent_clean_pred * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
 
             x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
             mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)

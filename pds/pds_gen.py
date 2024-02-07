@@ -35,7 +35,7 @@ class PDSGenerationConfig():
     seed: int = 45
     model: Literal['sd', 'sdxl'] = 'sd'
     src_method: Literal['step', 'sdedit'] = 'step'
-    thresholding: Optional[Literal['dynamic']] = None
+    thresholding: Optional[Literal['dynamic']] = 'dynamic'
     dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = (0.03, 0.97)
     prompt: str = 'a DSLR photo of a dog in a winter wonderland'
     extra_tgt_prompts: str = ', detailed high resolution, high quality, sharp'
@@ -156,6 +156,8 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
                 prompt=config.prompt,
                 extra_src_prompts=config.extra_src_prompts,
                 extra_tgt_prompts=config.extra_tgt_prompts,
+                thresholding=config.thresholding,
+                dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
                 src_method=config.src_method,
                 return_dict=True
             )
