@@ -30,6 +30,7 @@ class TimestepScheduleConfig():
 @dataclass
 class PDSGenerationConfig():
     wandb_enabled: bool = True
+    experiment_name: Optional[str] = None
     lr: float = 0.005
     n_steps: int = 4000
     seed: int = 45
@@ -195,25 +196,25 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
 def run_pds_gen(config: PDSGenerationConfig):
 
     config_dict = dataclass_to_dict(config)
-    run_name = '%s_pds_gen_%s/%s_lr%.3f_seed%d_%s' % (
+    experiment_name = '%s_pds_gen_%s/%s_lr%.3f_seed%d_%s' % (
         config.model,
         config.src_method,
         config.prompt.replace(' ', '_'),
         config.lr,
         config.seed,
         'threshold' if config.thresholding is not None else 'no_threshold'
-    )
+    ) if config.experiment_name is None else config.experiment_name
 
     if config.wandb_enabled:
         wandb.init(
             project="PDS-Gen",
-            name=run_name,
+            name=experiment_name,
             config=config_dict
         )
 
     training_loop(
         config,
-        save_dir = f'results/{run_name}'
+        save_dir = f'results/{experiment_name}'
     )
 
     if config.wandb_enabled:
@@ -221,6 +222,4 @@ def run_pds_gen(config: PDSGenerationConfig):
 
 
 if __name__ == "__main__":
-    run_pds_gen(
-        tyro.cli(run_pds_gen)
-    )
+    tyro.cli(run_pds_gen)

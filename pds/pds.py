@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 from PIL import Image
 import matplotlib.pyplot as plt
 from utils.imageutil import clip_image_at_percentiles
