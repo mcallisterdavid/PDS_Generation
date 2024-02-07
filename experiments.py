@@ -36,7 +36,7 @@ experiments_list = [
     ),
     Argument(
         name="baseline_pds_t_annealing",
-        arg_string="--config.prompt \'A DSLR photo of a giraffe\' --config.pds_t_schedule.mode schedule --config.pds_t_schedule.schedule linear --config.pds_t_schedule.lower_bound_final 0.03 --config.project_t_schedule.lower_bound_final 0.1",
+        arg_string="--config.prompt \'A DSLR photo of a giraffe\' --config.pds_t_schedule.mode schedule --config.pds_t_schedule.schedule  linear --config.pds_t_schedule.lower_bound_final 0.03 --config.pds_t_schedule.upper_bound_final 0.1 --config.pds_t_schedule.warmup_steps 0 --config.pds_t_schedule.num_steps 3000",
     ),
     Argument(
         name="baseline_dark_negative_prompt",
