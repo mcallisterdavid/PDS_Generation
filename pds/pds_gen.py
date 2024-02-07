@@ -41,9 +41,11 @@ parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--n_steps', type=int, default=3000)
 parser.add_argument('--model', type=str, default='sd', choices=['sd', 'sdxl'])
+parser.add_argument('--src_method', type=str, default='sdedit', choices=['sdedit', 'step'])
 args = parser.parse_args()
 
 init_image_fn = args.init_image_fn
+src_method = args.src_method
 
 if args.model == 'sd':
     pds = PDS(PDSConfig(
@@ -101,7 +103,7 @@ for step in tqdm(range(args.n_steps)):
 
     if init_image_fn is None:
         # A (generation)
-        skip_percentage = min(step / 1400, 0.97)
+        skip_percentage = min(step / 2000, 0.97)
     else:
         # B (projection to manifold)
         skip_percentage = 0.97
@@ -111,7 +113,7 @@ for step in tqdm(range(args.n_steps)):
         pds_dict = pds.pds_gen_sdedit_src(
             im=im,
             prompt=args.prompt,
-            src_method="sdedit",
+            src_method=src_method,
             skip_percentage = skip_percentage,
             num_solve_steps = 12 + min(step // 200, 20),
             return_dict=True
@@ -129,7 +131,7 @@ for step in tqdm(range(args.n_steps)):
     im.backward(gradient=grad)
 
     if init_image_fn is not None:
-        reconstruction_loss = F.mse_loss(im, reference_latent.clone()) * 1e0 * 4 # basically disabled, high CFG gradient dominates
+        reconstruction_loss = F.mse_loss(im, reference_latent.clone()) * 1e0 # basically disabled, high CFG gradient dominates
         reconstruction_loss.backward()
 
     im_optimizer.step()
