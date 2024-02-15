@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import DDIMScheduler, DiffusionPipeline
 from jaxtyping import Float
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, Union
 from PIL import Image
 import matplotlib.pyplot as plt
 from utils.imageutil import clip_image_at_percentiles
@@ -237,18 +237,24 @@ class PDS(object):
         im,
         t_project,
         t_edit,
+        source_im = None,
         prompt=None,
         num_solve_steps=20,
         src_cfg_scale=100,
         tgt_cfg_scale=100,
         thresholding: Optional[Literal['dynamic']] = None,
         dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = None,
+        loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z',
         extra_tgt_prompts=', detailed high resolution, high quality, sharp',
         extra_src_prompts=', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed',
         src_method: Literal["sdedit", "step"] = "step",
+        eps_loss_use_proj_x0: bool = True,
         reduction="mean",
         return_dict=False,
     ):
+        
+        assert eps_loss_use_proj_x0 or (not loss_coefficients == 'z'), 'Using Z formulation, eps loss must use projected x0'
+
         device = self.device
         scheduler = self.scheduler
 
@@ -261,7 +267,9 @@ class PDS(object):
         tgt_x0 = im
         batch_size = im.shape[0]
 
-        if src_method == "sdedit":
+        if source_im is not None:
+            src_x0 = source_im
+        elif src_method == "sdedit":
             src_x0 = self.run_sdedit(
                 x0=im,
                 tgt_prompt=prompt,
@@ -290,7 +298,8 @@ class PDS(object):
         for latent, cond_text_embedding, name, cfg_scale in zip(
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"], [tgt_cfg_scale, src_cfg_scale]
         ):
-            latents_noisy = scheduler.add_noise(latent, noise, t)
+            curr_x0 = latent if eps_loss_use_proj_x0 else tgt_x0
+            latents_noisy = scheduler.add_noise(curr_x0, noise, t)
             latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
             text_embeddings = torch.cat([cond_text_embedding, uncond_embedding], dim=0)
             noise_pred = self.unet.forward(
@@ -317,9 +326,13 @@ class PDS(object):
             beta_prod_t = 1 - alpha_prod_t
             noise_pred = (latents_noisy - latent_clean_pred * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
 
-            x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
-            mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
-            zt = (x_t_prev - mu) / sigma_t
+            if loss_coefficients == 'z':
+                x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
+                mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
+                zt = (x_t_prev - mu) / sigma_t
+            else:
+                x_coeff, eps_coeff = loss_coefficients
+                zt = x_coeff * latent + eps_coeff * noise_pred
             zts[name] = zt
 
         grad = zts["tgt"] - zts["src"]

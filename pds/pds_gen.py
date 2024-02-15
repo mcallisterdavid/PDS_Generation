@@ -7,7 +7,7 @@ import tyro
 from dataclasses import dataclass, asdict, is_dataclass
 import matplotlib.pyplot as plt
 import imageio
-from typing import Literal, Optional, Tuple, Any
+from typing import Literal, Optional, Tuple, Any, Union
 from utils.imageutil import permute_decoded_latent
 from utils.trainutil import seed_everything
 import os
@@ -31,19 +31,21 @@ class TimestepScheduleConfig():
 class PDSGenerationConfig():
     wandb_enabled: bool = True
     experiment_name: Optional[str] = None
-    lr: float = 0.005
+    lr: float = 0.004
+    loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z' # Set coefficients for x and eps terms, alternatively use z weighting
     n_steps: int = 4000
     seed: int = 45
     model: Literal['sd', 'sdxl'] = 'sd'
     src_method: Literal['step', 'sdedit'] = 'step'
-    thresholding: Optional[Literal['dynamic']] = 'dynamic'
-    dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = (0.03, 0.97)
+    thresholding: Optional[Literal['dynamic']] = None
+    dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = (0.015, 0.985)
     prompt: str = 'a DSLR photo of a dog in a winter wonderland'
     extra_tgt_prompts: str = ', detailed high resolution, high quality, sharp'
     extra_src_prompts: str = ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed'
     init_image_fn: Optional[str] = None
     project_cfg: float = 15
     pds_cfg: float = 100
+    eps_loss_use_proj_x0: bool = True
     pds_t_schedule: TimestepScheduleConfig = TimestepScheduleConfig(
         mode='fixed',
         upper_bound = 0.98,
@@ -53,8 +55,10 @@ class PDSGenerationConfig():
         mode = 'schedule',
         schedule = 'linear',
         upper_bound = 0.98,
+        # upper_bound = 0.1,
         lower_bound = 0.03,
-        upper_bound_final = 0.04,
+        # upper_bound_final = 0.04,
+        upper_bound_final = 0.05,
         lower_bound_final = 0.02,
         warmup_steps = 0,
         num_steps = 1400,
@@ -137,9 +141,12 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
         im = reference_latent.clone()
     else:
         im = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
+        # im  = torch.zeros_like(im)
 
     im.requires_grad_(True)
     im.retain_grad()
+
+    im_original = im.clone()
 
     im_optimizer = torch.optim.AdamW([im], lr=config.lr, betas=(0.9, 0.99), eps=1e-15)
     decodes = []
@@ -152,6 +159,7 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
             pds.config.guidance_scale = config.pds_cfg
             pds_dict = pds.pds_gen(
                 im=im,
+                # source_im=im_original,
                 t_project = sample_timestep(config.project_t_schedule, step),
                 t_edit = sample_timestep(config.pds_t_schedule, step),
                 prompt=config.prompt,
@@ -159,6 +167,10 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
                 extra_tgt_prompts=config.extra_tgt_prompts,
                 thresholding=config.thresholding,
                 dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
+                loss_coefficients=config.loss_coefficients,
+                eps_loss_use_proj_x0=config.eps_loss_use_proj_x0,
+                src_cfg_scale=config.pds_cfg,
+                tgt_cfg_scale=config.pds_cfg,
                 src_method=config.src_method,
                 return_dict=True
             )
@@ -168,9 +180,9 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
 
         im.backward(gradient=grad)
 
-        if config.init_image_fn is not None:
-            reconstruction_loss = F.mse_loss(im, reference_latent.clone()) # basically disabled, high CFG gradient dominates
-            reconstruction_loss.backward()
+        # if config.init_image_fn is not None:
+        #     reconstruction_loss = F.mse_loss(im, reference_latent.clone()) # basically disabled, high CFG gradient dominates
+        #     reconstruction_loss.backward()
 
         im_optimizer.step()
 
