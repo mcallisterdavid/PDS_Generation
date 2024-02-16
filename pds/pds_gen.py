@@ -33,7 +33,7 @@ class PDSGenerationConfig():
     experiment_name: Optional[str] = None
     lr: float = 0.004
     loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z' # Set coefficients for x and eps terms, alternatively use z weighting
-    n_steps: int = 4000
+    n_steps: int = 3200
     seed: int = 45
     model: Literal['sd', 'sdxl'] = 'sd'
     src_method: Literal['step', 'sdedit'] = 'step'
