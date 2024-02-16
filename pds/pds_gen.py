@@ -60,8 +60,8 @@ class PDSGenerationConfig():
         # upper_bound_final = 0.04,
         upper_bound_final = 0.05,
         lower_bound_final = 0.02,
-        warmup_steps = 0,
-        num_steps = 1400,
+        warmup_steps = 200,
+        num_steps = 1600,
     )
 
 def validate_timestep_config(cfg: TimestepScheduleConfig):
