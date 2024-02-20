@@ -14,7 +14,8 @@ from utils.imageutil import clip_image_at_percentiles
 class PDSConfig:
     sd_pretrained_model_or_path: str = "runwayml/stable-diffusion-v1-5"
 
-    num_inference_steps: int = 500
+    # num_inference_steps: int = 500
+    num_inference_steps: int = 50
     min_step_ratio: float = 0.02
     max_step_ratio: float = 0.98
 
@@ -36,6 +37,10 @@ class PDS(object):
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.scheduler.set_timesteps(config.num_inference_steps)
         self.pipe.scheduler = self.scheduler
+
+        self.scheduler.alphas = self.scheduler.alphas.to(self.device)
+        self.scheduler.betas = self.scheduler.betas.to(self.device)
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
 
         self.unet = self.pipe.unet
         self.tokenizer = self.pipe.tokenizer
@@ -478,6 +483,67 @@ class PDS(object):
         loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size
         if return_dict:
             dic = {"loss": loss, "grad": grad, "t": t}
+            return dic
+        else:
+            return loss
+
+    def reverse_process_loss(
+        self,
+        im,
+        t_sample=None,
+        prompt=None,
+        reduction="mean",
+        return_dict=False,
+    ):
+        device = self.device
+        scheduler = self.scheduler
+
+        # process text.
+        self.update_text_features(tgt_prompt=prompt, src_prompt=prompt)
+        tgt_text_embedding = self.tgt_text_feature
+        src_text_embedding = self.src_text_feature
+        uncond_embedding = self.null_text_feature
+
+        batch_size = im.shape[0]
+        t, t_prev = self.pds_timestep_sampling(batch_size, sample=t_sample)
+
+        noise = torch.randn_like(im)
+
+        # x_t
+        latents_noisy = scheduler.add_noise(im, noise, t)
+        latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+        text_embeddings = torch.cat([src_text_embedding, uncond_embedding], dim=0)
+        noise_pred = self.unet.forward(
+            latent_model_input,
+            torch.cat([t] * 2).to(device),
+            encoder_hidden_states=text_embeddings,
+        ).sample
+        noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        x_0_hat_pred = scheduler.step(noise_pred, t, latents_noisy).pred_original_sample
+
+        # x_{t-1}
+        latents_noisy_prev = scheduler.step(noise_pred, t, latents_noisy, eta=0).prev_sample
+        latent_model_input = torch.cat([latents_noisy_prev] * 2, dim=0)
+        text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding], dim=0)
+        noise_pred_prev = self.unet.forward(
+            latent_model_input,
+            torch.cat([t] * 2).to(device),
+            encoder_hidden_states=text_embeddings,
+        ).sample
+        noise_pred_text, noise_pred_uncond = noise_pred_prev.chunk(2)
+        noise_pred_prev = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        alpha_prod_t_prev = scheduler.alphas_cumprod[t_prev].to(device)
+        w = ((1 - alpha_prod_t_prev) / alpha_prod_t_prev) ** 0.5
+
+        grad = - w * (noise_pred_prev - noise_pred)
+        grad = torch.nan_to_num(grad)
+        target = (im - grad).detach()
+        loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size
+        if return_dict:
+            dic = {"loss": loss, "grad": grad, "t": t, "target": target}
             return dic
         else:
             return loss
