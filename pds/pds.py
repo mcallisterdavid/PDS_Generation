@@ -529,7 +529,7 @@ class PDS(object):
         text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding], dim=0)
         noise_pred_prev = self.unet.forward(
             latent_model_input,
-            torch.cat([t] * 2).to(device),
+            torch.cat([t_prev] * 2).to(device),
             encoder_hidden_states=text_embeddings,
         ).sample
         noise_pred_text, noise_pred_uncond = noise_pred_prev.chunk(2)
