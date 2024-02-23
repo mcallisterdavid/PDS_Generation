@@ -13,6 +13,7 @@ from utils.imageutil import clip_image_at_percentiles
 @dataclass
 class PDSConfig:
     sd_pretrained_model_or_path: str = "runwayml/stable-diffusion-v1-5"
+    texture_inversion_embedding: str = "./assets/learned_embeds-steps-1500.safetensors"
 
     # num_inference_steps: int = 500
     num_inference_steps: int = 50
@@ -33,6 +34,7 @@ class PDS(object):
         self.device = torch.device(config.device)
 
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
+        self.pipe.load_textual_inversion(config.texture_inversion_embedding)
 
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.scheduler.set_timesteps(config.num_inference_steps)
