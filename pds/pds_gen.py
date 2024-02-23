@@ -123,7 +123,8 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
 
     if config.model == 'sd':
         pds = PDS(PDSConfig(
-            sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base'
+            sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base',
+            texture_inversion_embedding='./pds/assets/learned_embeds-steps-1500.safetensors'
         ))
         latent_dim = 64
     else:
