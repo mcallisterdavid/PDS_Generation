@@ -8,7 +8,6 @@ from jaxtyping import Float
 from typing import Literal, Optional, Tuple, Union
 from PIL import Image
 import matplotlib.pyplot as plt
-from utils.imageutil import clip_image_at_percentiles
 
 @dataclass
 class PDSConfig:
@@ -74,6 +73,22 @@ class PDS(object):
 
         mean_func = c0 * pred_x0 + c1 * xt
         return mean_func
+
+    def clip_image_at_percentiles(image, lower_percentile, upper_percentile):
+        """
+        Clips the image at the given lower and upper percentiles.
+        """
+        # Flatten the image to compute percentiles
+        flattened_image = image.flatten()
+
+        # Compute the lower and upper bounds
+        lower_bound = torch.quantile(flattened_image, lower_percentile)
+        upper_bound = torch.quantile(flattened_image, upper_percentile)
+
+        # Clip the image
+        clipped_image = torch.clamp(image, lower_bound, upper_bound)
+
+        return clipped_image
 
     def encode_image(self, img_tensor: Float[torch.Tensor, "B C H W"]):
         x = img_tensor
@@ -345,7 +360,7 @@ class PDS(object):
         target = (tgt_x0 - grad).detach()
         loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size
         if return_dict:
-            dic = {"loss": loss, "grad": grad, "t": t, "src_x0": src_x0}
+            dic = {"loss": loss, "grad": grad, "t": t, "src_x0": src_x0, "target": target}
             return dic
         else:
             return loss
@@ -538,7 +553,7 @@ class PDS(object):
         alpha_prod_t_prev = scheduler.alphas_cumprod[t_prev].to(device)
         w = ((1 - alpha_prod_t_prev) / alpha_prod_t_prev) ** 0.5
 
-        grad = - w * (noise_pred_prev - noise_pred)
+        grad = w * (noise_pred - noise_pred_prev)
         grad = torch.nan_to_num(grad)
         target = (im - grad).detach()
         loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size

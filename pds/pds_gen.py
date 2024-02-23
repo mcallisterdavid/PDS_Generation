@@ -31,7 +31,7 @@ class TimestepScheduleConfig():
 class PDSGenerationConfig():
     wandb_enabled: bool = True
     experiment_name: Optional[str] = None
-    lr: float = 0.004
+    lr: float = 0.001
     loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z' # Set coefficients for x and eps terms, alternatively use z weighting
     n_steps: int = 3200
     seed: int = 45
@@ -159,7 +159,6 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
             pds.config.guidance_scale = config.pds_cfg
             pds_dict = pds.pds_gen(
                 im=im,
-                # source_im=im_original,
                 t_project = sample_timestep(config.project_t_schedule, step),
                 t_edit = sample_timestep(config.pds_t_schedule, step),
                 prompt=config.prompt,
