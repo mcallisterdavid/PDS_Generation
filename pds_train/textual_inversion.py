@@ -33,6 +33,9 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
+from pycocotools.coco import COCO
+from img_corruption_utils import gaussian_noise, shot_noise, impulse_noise, speckle_noise, gaussian_blur, \
+                                    defocus_blur, contrast, saturate, jpeg_compression, pixelate
 
 # TODO: remove and import from diffusers.utils when the new version of diffusers is released
 from packaging import version
@@ -53,7 +56,6 @@ from diffusers import (
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 
 
@@ -79,36 +81,8 @@ else:
 # ------------------------------------------------------------------------------
 
 
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.27.0.dev0")
 
 logger = get_logger(__name__)
-
-
-def save_model_card(repo_id: str, images: list = None, base_model: str = None, repo_folder: str = None):
-    img_str = ""
-    if images is not None:
-        for i, image in enumerate(images):
-            image.save(os.path.join(repo_folder, f"image_{i}.png"))
-            img_str += f"![img_{i}](./image_{i}.png)\n"
-    model_description = f"""
-# Textual inversion text2image fine-tuning - {repo_id}
-These are textual inversion adaption weights for {base_model}. You can find some example images in the following. \n
-{img_str}
-"""
-    model_card = load_or_create_model_card(
-        repo_id_or_path=repo_id,
-        from_training=True,
-        license="creativeml-openrail-m",
-        base_model=base_model,
-        model_description=model_description,
-        inference=True,
-    )
-
-    tags = ["stable-diffusion", "stable-diffusion-diffusers", "text-to-image", "diffusers", "textual_inversion"]
-    model_card = populate_model_card(model_card, tags=tags)
-
-    model_card.save(os.path.join(repo_folder, "README.md"))
 
 
 def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch):
@@ -219,7 +193,10 @@ def parse_args():
         help="Pretrained tokenizer name or path if not the same as model_name",
     )
     parser.add_argument(
-        "--train_data_dir", type=str, default=None, required=True, help="A folder containing the training data."
+        "--train_data_dir", type=str, default='/fs/vulcan-datasets/coco/images/train2017', help="A folder containing the training data."
+    )
+    parser.add_argument(
+        "--coco_json", type=str, default='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', help="A folder containing the training data."
     )
     parser.add_argument(
         "--placeholder_token",
@@ -232,7 +209,7 @@ def parse_args():
         "--initializer_token", type=str, default=None, required=True, help="A token to use as initializer word."
     )
     parser.add_argument("--learnable_property", type=str, default="object", help="Choose between 'object' and 'style'")
-    parser.add_argument("--repeats", type=int, default=100, help="How many times to repeat the training data.")
+    parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -576,6 +553,119 @@ class TextualInversionDataset(Dataset):
         return example
 
 
+class TextualInversionCOCODataset(Dataset):
+    def __init__(
+        self,
+        data_root,
+        json,
+        tokenizer,
+        learnable_property="object",  # [object, style]
+        size=512,
+        repeats=100,
+        interpolation="bicubic",
+        flip_p=0.5,
+        set="train",
+        placeholder_token="*",
+        center_crop=False,
+    ):
+        self.data_root = data_root
+        self.coco = COCO(json)
+        self.ids = list(self.coco.anns.keys())
+        self.tokenizer = tokenizer
+        self.learnable_property = learnable_property
+        self.size = size
+        self.placeholder_token = placeholder_token
+        self.center_crop = center_crop
+        self.flip_p = flip_p
+
+        self.num_images = len(self.ids)
+        self._length = self.num_images
+
+        if set == "train":
+            self._length = self.num_images * repeats
+
+        self.interpolation = {
+            "linear": PIL_INTERPOLATION["linear"],
+            "bilinear": PIL_INTERPOLATION["bilinear"],
+            "bicubic": PIL_INTERPOLATION["bicubic"],
+            "lanczos": PIL_INTERPOLATION["lanczos"],
+        }[interpolation]
+
+        self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
+        self.noise_perturb_ratio = 0.9
+        # self.noise_functions = [gaussian_noise, shot_noise, impulse_noise, speckle_noise, jpeg_compression, pixelate]
+        self.noise_functions = [gaussian_noise, jpeg_compression, pixelate]
+        self.blur_functions = [gaussian_blur, defocus_blur]
+        self.color_perturb_ratio = 0.6
+        self.color_functions = [contrast, saturate]
+
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, i):
+        coco = self.coco
+        ann_id = self.ids[i]
+        caption = coco.anns[ann_id]['caption']
+        img_id = coco.anns[ann_id]['image_id']
+        path = coco.loadImgs(img_id)[0]['file_name']
+
+        example = {}
+        image = Image.open(os.path.join(self.data_root, path))
+
+        if not image.mode == "RGB":
+            image = image.convert("RGB")
+
+        placeholder_string = self.placeholder_token
+        text = ' '.join([caption, placeholder_string])
+
+        example["input_ids"] = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        # default to score-sde preprocessing
+        img = np.array(image).astype(np.uint8)
+
+        if self.center_crop:
+            crop = min(img.shape[0], img.shape[1])
+            (
+                h,
+                w,
+            ) = (
+                img.shape[0],
+                img.shape[1],
+            )
+            img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
+
+        image = Image.fromarray(img)
+        image = image.resize((self.size, self.size), resample=self.interpolation)
+
+        image = self.flip_transform(image)
+        # perform random distortions
+        blur_func = random.choice(self.blur_functions)
+        blur_severity = random.randint(3, 5)
+        image = blur_func(image, blur_severity)
+        if random.random() < self.noise_perturb_ratio:
+            noise_func = random.choice(self.noise_functions)
+            noise_severity = random.randint(3, 5)
+            image = noise_func(image, noise_severity)
+        if random.random() < self.color_perturb_ratio:
+            color_func = random.choice(self.color_functions)
+            color_severity = random.randint(1, 5)
+            image = color_func(image, color_severity)
+
+        image = np.array(image).astype(np.uint8)
+
+        image = (image / 127.5 - 1.0).astype(np.float32)
+
+        example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
+        return example
+
+
 def main():
     args = parse_args()
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -728,8 +818,10 @@ def main():
     )
 
     # Dataset and DataLoaders creation:
-    train_dataset = TextualInversionDataset(
+    # import ipdb; ipdb.set_trace()
+    train_dataset = TextualInversionCOCODataset(
         data_root=args.train_data_dir,
+        json=args.coco_json,
         tokenizer=tokenizer,
         size=args.resolution,
         placeholder_token=(" ".join(tokenizer.convert_ids_to_tokens(placeholder_token_ids))),
@@ -903,11 +995,7 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 if global_step % args.save_steps == 0:
-                    weight_name = (
-                        f"learned_embeds-steps-{global_step}.bin"
-                        if args.no_safe_serialization
-                        else f"learned_embeds-steps-{global_step}.safetensors"
-                    )
+                    weight_name = f"-steps-{global_step}.bin"
                     save_path = os.path.join(args.output_dir, weight_name)
                     save_progress(
                         text_encoder,
@@ -983,20 +1071,6 @@ def main():
             save_path,
             safe_serialization=not args.no_safe_serialization,
         )
-
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                images=images,
-                base_model=args.pretrained_model_name_or_path,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
 
     accelerator.end_training()
 
