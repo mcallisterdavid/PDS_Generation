@@ -33,7 +33,10 @@ class PDS(object):
         self.device = torch.device(config.device)
 
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
-        self.pipe.load_textual_inversion(config.texture_inversion_embedding)
+        try:
+            self.pipe.load_textual_inversion(config.texture_inversion_embedding)
+        except:
+            print("UNABLE TO LOAD TEXTUAL INVERSION TOKENS")
 
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.scheduler.set_timesteps(config.num_inference_steps)
@@ -262,20 +265,24 @@ class PDS(object):
         source_im = None,
         prompt=None,
         num_solve_steps=20,
+        project_cfg_scale=15,
         src_cfg_scale=100,
         tgt_cfg_scale=100,
+        project_noise_sample=None,
+        project_from=None,
         thresholding: Optional[Literal['dynamic']] = None,
         dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = None,
         loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z',
         extra_tgt_prompts=', detailed high resolution, high quality, sharp',
         extra_src_prompts=', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed',
         src_method: Literal["sdedit", "step"] = "step",
-        eps_loss_use_proj_x0: bool = True,
+        project_x_loss: bool = True,
+        project_eps_loss: bool = True,
         reduction="mean",
         return_dict=False,
     ):
         
-        assert eps_loss_use_proj_x0 or (not loss_coefficients == 'z'), 'Using Z formulation, eps loss must use projected x0'
+        assert project_eps_loss or (not loss_coefficients == 'z'), 'Using Z formulation, eps loss must use projected x0'
 
         device = self.device
         scheduler = self.scheduler
@@ -288,23 +295,27 @@ class PDS(object):
 
         tgt_x0 = im
         batch_size = im.shape[0]
+        project_from = im if project_from is None else project_from
 
         if source_im is not None:
             src_x0 = source_im
         elif src_method == "sdedit":
             src_x0 = self.run_sdedit(
-                x0=im,
+                x0=project_from,
                 tgt_prompt=prompt,
                 num_inference_steps=num_solve_steps,
                 skip=int((1 - t_project) * num_solve_steps),
+                noise_sample=project_noise_sample,
             )
         elif src_method == "step":
 
             projection_timestep, _ = self.pds_timestep_sampling(batch_size, sample=t_project)
             src_x0 = self.run_single_step(
-                x0=im,
-                t = projection_timestep.item(),
+                x0=project_from,
+                t=projection_timestep.item(),
                 tgt_prompt=prompt,
+                cfg_scale=project_cfg_scale,
+                noise_sample=project_noise_sample,
             )
 
         t, t_prev = self.pds_timestep_sampling(batch_size, sample=t_edit)
@@ -320,8 +331,9 @@ class PDS(object):
         for latent, cond_text_embedding, name, cfg_scale in zip(
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"], [tgt_cfg_scale, src_cfg_scale]
         ):
-            curr_x0 = latent if eps_loss_use_proj_x0 else tgt_x0
-            latents_noisy = scheduler.add_noise(curr_x0, noise, t)
+            x_x0 = latent if project_x_loss else tgt_x0
+            eps_x0 = latent if project_eps_loss else tgt_x0
+            latents_noisy = scheduler.add_noise(eps_x0, noise, t)
             latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
             text_embeddings = torch.cat([cond_text_embedding, uncond_embedding], dim=0)
             noise_pred = self.unet.forward(
@@ -354,7 +366,7 @@ class PDS(object):
                 zt = (x_t_prev - mu) / sigma_t
             else:
                 x_coeff, eps_coeff = loss_coefficients
-                zt = x_coeff * latent + eps_coeff * noise_pred
+                zt = x_coeff * x_x0 + eps_coeff * noise_pred
             zts[name] = zt
 
         grad = zts["tgt"] - zts["src"]
@@ -565,7 +577,7 @@ class PDS(object):
         else:
             return loss
 
-    def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0):
+    def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0, noise_sample=None):
         scheduler = self.scheduler
         scheduler.set_timesteps(num_inference_steps)
         timesteps = scheduler.timesteps
@@ -573,7 +585,7 @@ class PDS(object):
 
         S = num_inference_steps - skip
         t = reversed_timesteps[S - 1]
-        noise = torch.randn_like(x0)
+        noise = torch.randn_like(x0) if noise_sample is None else noise_sample
 
         xt = scheduler.add_noise(x0, noise, t)
 
@@ -598,11 +610,20 @@ class PDS(object):
 
         return xt
 
-    def run_single_step(self, x0, t: int, tgt_prompt=None, percentile_clip=False, eta=0):
+    def run_single_step(
+        self,
+        x0,
+        t: int,
+        cfg_scale: float = 15,
+        tgt_prompt=None,
+        percentile_clip=False,
+        eta=0,
+        noise_sample=None
+    ):
         scheduler = self.scheduler
 
         t = torch.tensor(t, device=x0.device, dtype=torch.long)
-        noise = torch.randn_like(x0)
+        noise = torch.randn_like(x0) if noise_sample is None else noise_sample
 
         xt = scheduler.add_noise(x0, noise, t)
 
@@ -618,7 +639,7 @@ class PDS(object):
             encoder_hidden_states=text_embeddings,
         ).sample
         noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + self.config.sdedit_guidance_scale * (noise_pred_text - noise_pred_uncond)
+        noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
 
         xhat_pred = self.scheduler.step(noise_pred, t, xt, eta=eta).pred_original_sample
 

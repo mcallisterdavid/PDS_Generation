@@ -21,11 +21,15 @@ import random
 import shutil
 import warnings
 from pathlib import Path
+from typing import *
+from jaxtyping import *
 
 import numpy as np
+import pandas as pd
 import PIL
 import safetensors
 import torch
+from torch import Tensor
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -48,7 +52,10 @@ from transformers import CLIPTextModel, CLIPTokenizer
 import diffusers
 from diffusers import (
     AutoencoderKL,
+    DDPMPipeline,
     DDPMScheduler,
+    DDIMPipeline,
+    DDIMScheduler,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
     StableDiffusionPipeline,
@@ -194,6 +201,9 @@ def parse_args():
     )
     parser.add_argument(
         "--train_data_dir", type=str, default='/fs/vulcan-datasets/coco/images/train2017', help="A folder containing the training data."
+    )
+    parser.add_argument(
+        "--prompts_csv", type=str, default="./prompt_dataset/1k.csv", help="CSV of prompts with columns \'prompts\', \'raw data\'"
     )
     parser.add_argument(
         "--coco_json", type=str, default='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', help="A folder containing the training data."
@@ -552,6 +562,267 @@ class TextualInversionDataset(Dataset):
         example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
         return example
 
+class DiffusionPredictionDataset(Dataset):
+    def __init__(
+        self,
+        prompts_csv,
+        tokenizer,
+        device,
+        model_key="stabilityai/stable-diffusion-2-1-base",
+        num_inference_steps=25,
+        learnable_property="object",  # [object, style]
+        strength_range: Tuple[Float, Float] = (0.08, 0.75),
+        cfg_range: Tuple[Float, Float] = (7.5, 100),
+        size=512,
+        repeats=100,
+        interpolation="bicubic",
+        flip_p=0.5,
+        set="train",
+        placeholder_token="*",
+        center_crop=False,
+    ):
+        self.model_key = model_key
+        self.prompts_csv = prompts_csv
+        self.prompts_df = pd.read_csv(prompts_csv, usecols=['prompt', 'raw_data'])
+        self.prompts_df = self.prompts_df[self.prompts_df['prompt'].apply(lambda x: isinstance(x, str))]
+
+        self.cfg_range = cfg_range
+        self.strength_range = strength_range
+        self.num_inference_steps = num_inference_steps
+        self.device = device
+        self.tokenizer = tokenizer
+        self.learnable_property = learnable_property
+        self.size = size
+        self.placeholder_token = placeholder_token
+        self.center_crop = center_crop
+        self.flip_p = flip_p
+
+        # self.num_images = len(self.ids)
+        # self._length = self.num_images
+
+        # if set == "train":
+            # self._length = self.num_images * repeats
+        self._length = len(self.prompts_df)
+
+        self.interpolation = {
+            "linear": PIL_INTERPOLATION["linear"],
+            "bilinear": PIL_INTERPOLATION["bilinear"],
+            "bicubic": PIL_INTERPOLATION["bicubic"],
+            "lanczos": PIL_INTERPOLATION["lanczos"],
+        }[interpolation]
+
+        self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
+        self.noise_perturb_ratio = 0.9
+        # self.noise_functions = [gaussian_noise, shot_noise, impulse_noise, speckle_noise, jpeg_compression, pixelate]
+        self.noise_functions = [gaussian_noise, jpeg_compression, pixelate]
+        self.blur_functions = [gaussian_blur, defocus_blur]
+        self.color_perturb_ratio = 0.6
+        self.color_functions = [contrast, saturate]
+
+        self.pipe = StableDiffusionPipeline.from_pretrained(self.model_key, torch_dtype=torch.float16).to(self.device)
+
+        # self.pipe.enable_attention_slicing(1)
+        # self.pipe.unet.to(memory_format=torch.channels_last)
+
+        self.vae = self.pipe.vae
+        self.tokenizer = self.pipe.tokenizer
+        self.text_encoder = self.pipe.text_encoder
+        self.unet = self.pipe.unet
+
+        # Set up diffusion scheduler
+        self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self.scheduler.num_inference_steps = num_inference_steps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+
+        self.scheduler.alphas = self.scheduler.alphas.to(device)
+        self.scheduler.betas = self.scheduler.betas.to(device)
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
+
+    def latents_to_img(self, latents: Float[Tensor, "BS 4 H W"]) -> Float[Tensor, "BS 3 H W"]:
+        """Convert latents to images
+        Args:
+            latents: Latents to convert
+        Returns:
+            Images
+        """
+
+        latents = 1 / (self.vae.config.scaling_factor) * latents
+
+        with torch.no_grad():
+            imgs = self.vae.decode(latents).sample
+
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+
+        return imgs
+
+    def decode_latent(self, latent):
+        latent = latent.detach().half().to(self.device)
+        with torch.no_grad():
+            rgb = self.latents_to_img(latent)
+        rgb = rgb.float().cpu()[0].permute(1, 2, 0)
+        return rgb
+
+    def get_text_embeds(
+        self, prompt: Union[str, List[str]], negative_prompt: Union[str, List[str]]
+    ) -> Float[Tensor, "2 max_length embed_dim"]:
+        """Get text embeddings for prompt and negative prompt
+        Args:
+            prompt: Prompt text
+            negative_prompt: Negative prompt text
+        Returns:
+            Text embeddings
+        """
+
+        # Tokenize text and get embeddings
+        text_input = self.pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        with torch.no_grad():
+            text_embeddings = self.pipe.text_encoder(text_input.input_ids.to(self.device))[0]
+
+        # Do the same for unconditional embeddings
+        uncond_input = self.pipe.tokenizer(
+            negative_prompt, padding="max_length", max_length=self.pipe.tokenizer.model_max_length, return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            uncond_embeddings = self.pipe.text_encoder(uncond_input.input_ids.to(self.device))[0]
+
+        # Cat for final embeddings
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+        return text_embeddings
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, idx):
+
+        example = {}
+        caption, _ = self.prompts_df.iloc[idx]
+
+        rand_float = torch.rand((1,)).item()
+        strength_min, strength_max = self.strength_range
+        strength = strength_min + rand_float * (strength_max - strength_min)
+        num_steps = int(strength * self.num_inference_steps)
+
+        rand_float = torch.rand((1,)).item()
+        cfg_min, cfg_max = self.cfg_range
+        cfg = cfg_min + rand_float * (cfg_max - cfg_min)
+
+        with torch.no_grad():
+            num_channels_latents = self.pipe.unet.config.in_channels
+
+            try:
+                text_embeddings = self.get_text_embeds(caption, "")
+            except:
+                print(type(caption))
+                print(caption)
+            x_t = self.pipe.prepare_latents(
+                1,
+                num_channels_latents,
+                512,
+                512,
+                torch.float,
+                self.device,
+                None,
+            ).to(self.device)
+
+            timesteps = self.scheduler.timesteps[:num_steps]
+
+            for t in timesteps:
+
+                t = torch.tensor([t], device=self.device)
+
+                # Reshape diffusion inputs so that text embeddings match for CFG and multiple copies
+                latent_model_input = torch.cat((x_t,) * 2).to(self.device)
+                embed_uncond, embed_cond = text_embeddings.to(self.device).chunk(2)
+                embed_uncond = torch.cat((embed_uncond,) * 1)
+                embed_cond = torch.cat((embed_cond,) * 1)
+                text_embedding_input = torch.cat((embed_uncond, embed_cond))
+                t_input = torch.cat((t,) * 2 * 1)
+
+                noise_pred = self.pipe.unet(
+                    latent_model_input.to(torch.float16),
+                    t_input.to(torch.float16),
+                    encoder_hidden_states=text_embedding_input.to(torch.float16),
+                ).sample
+
+                # perform classifier-free guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_text + cfg * (noise_pred_text - noise_pred_uncond)
+                noise_pred = noise_pred
+
+                x_0_pred = self.scheduler.step(noise_pred, t, x_t).pred_original_sample
+
+                # v_pred for x_t -> x_0_pred_mean
+                x_t = self.scheduler.step(noise_pred, t, x_t).prev_sample
+
+            img = self.decode_latent(x_0_pred).cpu()
+
+        img *= 255
+        img = img.numpy().astype(np.uint8)
+
+
+        # if not image.mode == "RGB":
+        #     image = image.convert("RGB")
+
+        placeholder_string = self.placeholder_token
+        text = ' '.join([caption, placeholder_string])
+
+        example["input_ids"] = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        # default to score-sde preprocessing
+        # img = np.array(image).astype(np.uint8)
+
+        if self.center_crop:
+            crop = min(img.shape[0], img.shape[1])
+            (
+                h,
+                w,
+            ) = (
+                img.shape[0],
+                img.shape[1],
+            )
+            img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
+
+        image = Image.fromarray(img)
+        image = image.resize((self.size, self.size), resample=self.interpolation)
+
+        image.save('./debug.png')
+
+        # image = self.flip_transform(image)
+        # # perform random distortions
+        # blur_func = random.choice(self.blur_functions)
+        # blur_severity = random.randint(3, 5)
+        # image = blur_func(image, blur_severity)
+        # if random.random() < self.noise_perturb_ratio:
+        #     noise_func = random.choice(self.noise_functions)
+        #     noise_severity = random.randint(3, 5)
+        #     image = noise_func(image, noise_severity)
+        # if random.random() < self.color_perturb_ratio:
+        #     color_func = random.choice(self.color_functions)
+        #     color_severity = random.randint(1, 5)
+        #     image = color_func(image, color_severity)
+
+        image = np.array(image).astype(np.uint8)
+
+        image = (image / 127.5 - 1.0).astype(np.float32)
+
+        example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
+        return example
+
 
 class TextualInversionCOCODataset(Dataset):
     def __init__(
@@ -819,17 +1090,29 @@ def main():
 
     # Dataset and DataLoaders creation:
     # import ipdb; ipdb.set_trace()
-    train_dataset = TextualInversionCOCODataset(
-        data_root=args.train_data_dir,
-        json=args.coco_json,
+    # train_dataset = TextualInversionCOCODataset(
+    #     data_root=args.train_data_dir,
+    #     json=args.coco_json,
+    #     tokenizer=tokenizer,
+    #     size=args.resolution,
+    #     placeholder_token=(" ".join(tokenizer.convert_ids_to_tokens(placeholder_token_ids))),
+    #     repeats=args.repeats,
+    #     learnable_property=args.learnable_property,
+    #     center_crop=args.center_crop,
+    #     set="train",
+    # )
+
+    train_dataset = DiffusionPredictionDataset(
+        prompts_csv=args.prompts_csv,
         tokenizer=tokenizer,
+        device=accelerator.device,
         size=args.resolution,
         placeholder_token=(" ".join(tokenizer.convert_ids_to_tokens(placeholder_token_ids))),
-        repeats=args.repeats,
         learnable_property=args.learnable_property,
         center_crop=args.center_crop,
         set="train",
     )
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )

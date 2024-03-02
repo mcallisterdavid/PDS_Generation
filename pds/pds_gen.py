@@ -17,6 +17,14 @@ from pds import PDS, PDSConfig
 from pds_sdxl import PDS_sdxl, PDS_sdxlConfig
 
 @dataclass
+class SimpleScheduleConfig():
+    mode: Literal['fixed', 'schedule'] = 'fixed'
+    value_initial: float = 0.98
+    value_final: float = 0.03
+    warmup_steps: Optional[int] = None
+    num_steps: Optional[int] = None
+
+@dataclass
 class TimestepScheduleConfig():
     mode: Literal['fixed', 'schedule'] = 'fixed'
     schedule: Optional[Literal['linear', 'cosine']] = None
@@ -31,21 +39,33 @@ class TimestepScheduleConfig():
 class PDSGenerationConfig():
     wandb_enabled: bool = True
     experiment_name: Optional[str] = None
-    lr: float = 0.001
-    loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z' # Set coefficients for x and eps terms, alternatively use z weighting
+    lr: float = 0.008
+    loss_coefficients: Union[Tuple[float, float], Literal['z']] = (0.3, 1) # Set coefficients for x and eps terms, alternatively use z weighting
     n_steps: int = 3200
     seed: int = 45
+    optimize_canvas: bool = False
+    fixed_noise_sample: bool = False
+    project_from_original: bool = False
     model: Literal['sd', 'sdxl'] = 'sd'
     src_method: Literal['step', 'sdedit'] = 'step'
     thresholding: Optional[Literal['dynamic']] = None
     dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = (0.015, 0.985)
     prompt: str = 'a DSLR photo of a dog in a winter wonderland'
     extra_tgt_prompts: str = ', detailed high resolution, high quality, sharp'
-    extra_src_prompts: str = ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed'
+    # extra_src_prompts: str = ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed'
+    extra_src_prompts: str = '. <pds>'
     init_image_fn: Optional[str] = None
-    project_cfg: float = 15
+    # project_cfg: float = 15
+    project_cfg: SimpleScheduleConfig = SimpleScheduleConfig(
+        mode='schedule',
+        value_initial=100,
+        value_final=15,
+        warmup_steps=400,
+        num_steps=1600,
+    )
     pds_cfg: float = 100
-    eps_loss_use_proj_x0: bool = True
+    project_x_loss: bool = True
+    project_eps_loss: bool = True
     pds_t_schedule: TimestepScheduleConfig = TimestepScheduleConfig(
         mode='fixed',
         upper_bound = 0.98,
@@ -70,8 +90,7 @@ def validate_timestep_config(cfg: TimestepScheduleConfig):
             cfg.upper_bound_final is None and 
             cfg.lower_bound_final is None and 
             cfg.num_steps is None and 
-            cfg.warmup_steps is None and
-            cfg.schedule is None
+            cfg.warmup_steps is None
         ):
             raise ValueError('Only set upper_bound and lower_bound for fixed timestep schedule.')
     if cfg.mode == 'schedule':
@@ -94,6 +113,15 @@ def dataclass_to_dict(obj: Any) -> dict:
     else:
         return obj
     
+def sample_simple_schedule(sched: SimpleScheduleConfig, train_step: int):
+    interp = (train_step - sched.warmup_steps) / (sched.num_steps - sched.warmup_steps)
+    interp = max(0, interp)
+    interp = min(1, interp)
+
+    sample = sched.value_initial + interp * (sched.value_final - sched.value_initial)
+    return sample
+
+
 # Returns timestep normalized to range (0, 1)
 def sample_timestep(t_cfg: TimestepScheduleConfig, train_step: int):
 
@@ -120,11 +148,13 @@ def sample_timestep(t_cfg: TimestepScheduleConfig, train_step: int):
 def training_loop(config: PDSGenerationConfig, save_dir: str):
 
     os.makedirs(save_dir, exist_ok=True)
+    seed_everything(config.seed)
 
     if config.model == 'sd':
         pds = PDS(PDSConfig(
             sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base',
             texture_inversion_embedding='./pds/assets/learned_embeds-steps-1500.safetensors'
+            # texture_inversion_embedding='./pds/assets/-steps-6000.bin'
         ))
         latent_dim = 64
     else:
@@ -140,9 +170,12 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
 
         reference_latent = pds.encode_image(reference)
         im = reference_latent.clone()
+    elif not config.optimize_canvas:
+        im = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device) * 0.1
     else:
-        im = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
-        # im  = torch.zeros_like(im)
+        im = torch.randn((1, 4, int(latent_dim * 1.3), int(1.3 * latent_dim)), device=pds.unet.device) * 0.1
+
+    noise_sample = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
 
     im.requires_grad_(True)
     im.retain_grad()
@@ -156,10 +189,29 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
     for step in tqdm(range(config.n_steps)):
         im_optimizer.zero_grad()
 
+        if config.optimize_canvas:
+           rand_float = torch.rand((1,)).item()
+           scale_min, scale_max = 50, 70
+           scale = int(scale_min + rand_float * (scale_max - scale_min))
+           rand_float = torch.rand((1,)).item()
+           x = (im.shape[3] - scale) * rand_float
+           x = int(x)
+           rand_float = torch.rand((1,)).item()
+           y = (im.shape[2] - scale) * rand_float
+           y = int(y)
+
+           im_opt = im[:, :, y:y+scale, x:x+scale]
+           im_opt = F.interpolate(im_opt, (latent_dim, latent_dim))
+           im_og = im_original[:, :, y:y+scale, x:x+scale]
+           im_og = F.interpolate(im_og, (latent_dim, latent_dim))
+        else:
+            im_opt = im
+            im_og = im_original
+
         with torch.no_grad():
-            pds.config.guidance_scale = config.pds_cfg
+
             pds_dict = pds.pds_gen(
-                im=im,
+                im=im_opt,
                 t_project = sample_timestep(config.project_t_schedule, step),
                 t_edit = sample_timestep(config.pds_t_schedule, step),
                 prompt=config.prompt,
@@ -168,9 +220,13 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
                 thresholding=config.thresholding,
                 dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
                 loss_coefficients=config.loss_coefficients,
-                eps_loss_use_proj_x0=config.eps_loss_use_proj_x0,
+                project_x_loss=config.project_x_loss,
+                project_eps_loss=config.project_eps_loss,
+                project_cfg_scale=sample_simple_schedule(config.project_cfg, step),
                 src_cfg_scale=config.pds_cfg,
                 tgt_cfg_scale=config.pds_cfg,
+                project_noise_sample=noise_sample if config.fixed_noise_sample else None,
+                project_from=im_og if config.project_from_original else None,
                 src_method=config.src_method,
                 return_dict=True
             )
@@ -178,10 +234,10 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
         grad = pds_dict['grad']
         src_x0 = pds_dict['src_x0']
 
-        im.backward(gradient=grad)
+        im_opt.backward(gradient=grad)
 
         # if config.init_image_fn is not None:
-        #     reconstruction_loss = F.mse_loss(im, reference_latent.clone()) # basically disabled, high CFG gradient dominates
+        #     reconstruction_loss = F.mse_loss(im, reference_latent.clone()) * 500 # basically disabled, high CFG gradient dominates
         #     reconstruction_loss.backward()
 
         im_optimizer.step()
