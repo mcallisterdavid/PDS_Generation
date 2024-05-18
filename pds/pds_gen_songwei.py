@@ -12,6 +12,8 @@ from utils.imageutil import permute_decoded_latent
 from utils.trainutil import seed_everything
 import os
 from tqdm import tqdm
+from PIL import Image
+from datetime import datetime
 
 from pds_songwei import PDS, PDSConfig
 from pds_sdxl import PDS_sdxl, PDS_sdxlConfig
@@ -38,9 +40,10 @@ class TimestepScheduleConfig():
 @dataclass
 class PDSGenerationConfig():
     wandb_enabled: bool = True
+    run_name: Optional[str] = 'xds'
     experiment_name: Optional[str] = None
     lr: float = 0.008
-    loss_coefficients: Union[Tuple[float, float], Literal['z']] = (1, 1) # Set coefficients for x and eps terms, alternatively use z weighting
+    loss_coefficients: Union[Tuple[float, float], Literal['z']] = (0.3, 1) # Set coefficients for x and eps terms, alternatively use z weighting
     n_steps: int = 3200
     seed: int = 45
     optimize_canvas: bool = False
@@ -53,8 +56,8 @@ class PDSGenerationConfig():
     prompt: str = 'a DSLR photo of a dog in a winter wonderland'
     extra_tgt_prompts: str = '.'
     # extra_tgt_prompts: str = ', detailed high resolution, high quality, sharp'
-    # extra_src_prompts: str = ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed'
-    extra_src_prompts: str = '. <pds>'
+    extra_src_prompts: str = ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed'
+    # extra_src_prompts: str = '. <pds>'
     init_image_fn: Optional[str] = None
     # project_cfg: float = 15
     project_cfg: SimpleScheduleConfig = SimpleScheduleConfig(
@@ -68,6 +71,7 @@ class PDSGenerationConfig():
     project_x_loss: bool = True
     project_eps_loss: bool = True
     init_x0: bool = False
+    adaptive_src_prompt: bool = False
     pds_t_schedule: TimestepScheduleConfig = TimestepScheduleConfig(
         mode='fixed',
         upper_bound = 0.98,
@@ -201,6 +205,17 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + 7.5 * (noise_pred_text - noise_pred_uncond)
             im = pds.scheduler.step(noise_pred, t, latents_noisy).pred_original_sample
+    
+    # load clip models to dynamically change the negative prompts
+    if config.adaptive_src_prompt:
+        pds.load_clip_models()
+        base_prompt = config.prompt
+        corruption_types = ['noisy', 'JPEG compressed', 'oversaturated', 'smooth', 'pixelated', 'cartoon', 'foggy', 'hazy', 'blurry', 'malformed']
+        # text = tokenizer([base_prompt]+[f'{base_prompt}, {corruption_type}' for corruption_type in corruption_types])
+        # tokenized_corruptions = pds.clip_tokenizer([base_prompt]+[f'A {corruption_type} photo of {base_prompt}' for corruption_type in corruption_types])
+        tokenized_corruptions = pds.clip_tokenizer([f'A {corruption_type} photo of {base_prompt}' for corruption_type in corruption_types])
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            text_features = pds.clip_model.encode_text(tokenized_corruptions)
 
     im.requires_grad_(True)
     im.retain_grad()
@@ -210,6 +225,8 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
     im_optimizer = torch.optim.AdamW([im], lr=config.lr, betas=(0.9, 0.99), eps=1e-15)
     decodes = []
     decodes_src = []
+
+    src_prompts = config.prompt + config.extra_src_prompts
 
     for step in tqdm(range(config.n_steps)):
         im_optimizer.zero_grad()
@@ -240,7 +257,7 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
                 t_project = sample_timestep(config.project_t_schedule, step),
                 t_edit = sample_timestep(config.pds_t_schedule, step),
                 prompt=config.prompt,
-                extra_src_prompts=config.extra_src_prompts,
+                src_prompts=src_prompts,
                 extra_tgt_prompts=config.extra_tgt_prompts,
                 thresholding=config.thresholding,
                 dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
@@ -283,6 +300,16 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
                 wandb.log({"Target Projection (Proj. Good)": wandb.Image(decoded_src)})
 
         if step % 100 == 0:
+            if config.adaptive_src_prompt:
+                with torch.no_grad(), torch.cuda.amp.autocast():
+                    clip_image = pds.clip_preprocess(Image.fromarray((decoded.astype(np.float32) * 255).astype(np.uint8))).unsqueeze(0)
+                    image_features = pds.clip_model.encode_image(clip_image)
+                    image_features /= image_features.norm(dim=-1, keepdim=True)
+                    text_features /= text_features.norm(dim=-1, keepdim=True)
+                    text_probs = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+                    top3_corruptions = torch.topk(text_probs[0, :], 3)
+                    src_prompts = base_prompt + ', ' + ', '.join([corruption_types[i] for i in top3_corruptions.indices])
+                    print(f"updated src prompts: {src_prompts}")
             imageio.mimwrite(os.path.join(save_dir, 'pds_cat_tgt.mp4'), np.stack(decodes).astype(np.float32)*255, fps=10, codec='libx264')
             imageio.mimwrite(os.path.join(save_dir, 'pds_cat_x0.mp4'), np.stack(decodes_src).astype(np.float32)*255, fps=10, codec='libx264')
 
@@ -290,7 +317,10 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
 def run_pds_gen(config: PDSGenerationConfig):
 
     config_dict = dataclass_to_dict(config)
-    experiment_name = '0430/emulate_%s_%s/%s_lr%.3f_seed%d_%s' % (
+    date = datetime.now().strftime("%m-%d")
+    experiment_name = '%s/%s_%s_%s/%s_lr%.3f_seed%d_%s' % (
+        date,
+        config.run_name,
         config.model,
         config.src_method,
         config.prompt.replace(' ', '_'),

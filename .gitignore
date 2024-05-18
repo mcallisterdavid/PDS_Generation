@@ -8,5 +8,6 @@ data/*
 *.swp
 **/outputs/
 **/data/
-results/
+results*
+illusion*
 local_scripts/

@@ -8,8 +8,9 @@ import numpy as np
 from PIL import Image
 from pycocotools.coco import COCO
 # from pds_train.coco_utils import CocoDataset
-# dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images', json='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', vocab=None)
-
+# dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/train2017', json='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', vocab=None)
+# dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/val2017', json='/fs/vulcan-datasets/coco/annotations/captions_val2017.json', vocab=None)
+# image, caption = dataset.__getitem__(0)
 class CocoDataset(data.Dataset):
     """COCO Custom Dataset compatible with torch.utils.data.DataLoader."""
     def __init__(self, root, json, vocab, transform=None):

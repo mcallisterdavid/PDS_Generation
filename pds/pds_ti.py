@@ -8,13 +8,11 @@ from jaxtyping import Float
 from typing import Literal, Optional, Tuple, Union
 from PIL import Image
 import matplotlib.pyplot as plt
-
-import open_clip
+from utils.imageutil import clip_image_at_percentiles
 
 @dataclass
 class PDSConfig:
     sd_pretrained_model_or_path: str = "runwayml/stable-diffusion-v1-5"
-    texture_inversion_embedding: str = "./pds/assets/learned_embeds-steps-1500.safetensors"
 
     # num_inference_steps: int = 500
     num_inference_steps: int = 50
@@ -35,7 +33,7 @@ class PDS(object):
         self.device = torch.device(config.device)
 
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
-        self.pipe.load_textual_inversion(config.texture_inversion_embedding)
+        self.pipe.load_textual_inversion("pds_train/textual_inversion_pds/learned_embeds-steps-1500.safetensors")
 
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.scheduler.set_timesteps(config.num_inference_steps)
@@ -60,10 +58,6 @@ class PDS(object):
 
         self.update_text_features(src_prompt=self.src_prompt, tgt_prompt=self.tgt_prompt)
         self.null_text_feature = self.encode_text("")
-    
-    def load_clip_models(self):
-        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms('ViT-H-14')
-        self.clip_tokenizer = open_clip.get_tokenizer('ViT-H-14')
 
     def compute_posterior_mean(self, xt, noise_pred, t, t_prev):
         """
@@ -81,22 +75,6 @@ class PDS(object):
 
         mean_func = c0 * pred_x0 + c1 * xt
         return mean_func
-
-    def clip_image_at_percentiles(image, lower_percentile, upper_percentile):
-        """
-        Clips the image at the given lower and upper percentiles.
-        """
-        # Flatten the image to compute percentiles
-        flattened_image = image.flatten()
-
-        # Compute the lower and upper bounds
-        lower_bound = torch.quantile(flattened_image, lower_percentile)
-        upper_bound = torch.quantile(flattened_image, upper_percentile)
-
-        # Clip the image
-        clipped_image = torch.clamp(image, lower_bound, upper_bound)
-
-        return clipped_image
 
     def encode_image(self, img_tensor: Float[torch.Tensor, "B C H W"]):
         x = img_tensor
@@ -268,59 +246,46 @@ class PDS(object):
         source_im = None,
         prompt=None,
         num_solve_steps=20,
-        project_cfg_scale=15,
         src_cfg_scale=100,
         tgt_cfg_scale=100,
-        project_noise_sample=None,
-        project_from=None,
         thresholding: Optional[Literal['dynamic']] = None,
         dynamic_thresholding_cutoffs: Optional[Tuple[float, float]] = None,
         loss_coefficients: Union[Tuple[float, float], Literal['z']] = 'z',
-        extra_tgt_prompts=', detailed high resolution, high quality, sharp',
-        src_prompts=', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed',
+        extra_tgt_prompts='.',
+        extra_src_prompts='. <pds>',
         src_method: Literal["sdedit", "step"] = "step",
-        project_x_loss: bool = True,
-        project_eps_loss: bool = True,
+        eps_loss_use_proj_x0: bool = True,
         reduction="mean",
         return_dict=False,
-        t_max=1,
-        run_as_rgb=False
     ):
         
-        assert project_eps_loss or (not loss_coefficients == 'z'), 'Using Z formulation, eps loss must use projected x0'
+        assert eps_loss_use_proj_x0 or (not loss_coefficients == 'z'), 'Using Z formulation, eps loss must use projected x0'
 
         device = self.device
         scheduler = self.scheduler
-        if run_as_rgb:
-            with torch.enable_grad():
-                im = self.encode_image(im)
-        else:
-            im = im
 
         # process text.
-        self.update_text_features(tgt_prompt=prompt + extra_tgt_prompts, src_prompt=src_prompts)
+        self.update_text_features(tgt_prompt=prompt + extra_tgt_prompts, src_prompt=prompt + extra_src_prompts)
         tgt_text_embedding = self.tgt_text_feature
         src_text_embedding = self.src_text_feature
         uncond_embedding = self.null_text_feature
 
         tgt_x0 = im
         batch_size = im.shape[0]
-        project_from = im if project_from is None else project_from
 
         if source_im is not None:
             src_x0 = source_im
         elif src_method == "sdedit":
             src_x0 = self.run_sdedit(
-                x0=project_from,
+                x0=im,
                 tgt_prompt=prompt,
                 num_inference_steps=num_solve_steps,
                 skip=int((1 - t_project) * num_solve_steps),
-                noise_sample=project_noise_sample,
             )
         elif src_method == "step":
 
             projection_timestep, _ = self.pds_timestep_sampling(batch_size, sample=t_project)
-            src_x0, noise = self.run_single_step(
+            src_x0 = self.run_single_step(
                 x0=im,
                 t = projection_timestep.item(),
                 tgt_prompt=prompt,
@@ -332,10 +297,6 @@ class PDS(object):
         alpha_bar_t_prev = scheduler.alphas_cumprod[t_prev].to(device)
         sigma_t = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t) ** (0.5)
 
-        # t_bad = (t*15).clamp(1, t_max)
-        # alpha_prod_t_bad = scheduler.alphas_cumprod[t].to(device)
-        # w_eps = ((1 - alpha_prod_t_bad) / alpha_prod_t_bad) ** 0.5
-
         noise = torch.randn_like(tgt_x0)
         noise_t_prev = torch.randn_like(tgt_x0)
 
@@ -343,13 +304,8 @@ class PDS(object):
         for latent, cond_text_embedding, name, cfg_scale in zip(
             [tgt_x0, src_x0], [tgt_text_embedding, src_text_embedding], ["tgt", "src"], [tgt_cfg_scale, src_cfg_scale]
         ):
-            x_x0 = latent if project_x_loss else tgt_x0
-            eps_x0 = latent if project_eps_loss else tgt_x0
-            latents_noisy = scheduler.add_noise(eps_x0, noise, t)
-            # if name == "tgt":
-            #     latents_noisy = scheduler.add_noise(eps_x0, noise, t)
-            # else:
-            #     latents_noisy = scheduler.add_noise(eps_x0, noise, t_bad)
+            curr_x0 = latent if eps_loss_use_proj_x0 else tgt_x0
+            latents_noisy = scheduler.add_noise(curr_x0, noise, t)
             latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
             text_embeddings = torch.cat([cond_text_embedding, uncond_embedding], dim=0)
             noise_pred = self.unet.forward(
@@ -372,9 +328,9 @@ class PDS(object):
                 clean_pred /= clean_pred.max()
                 latent_clean_pred = self.encode_image(clean_pred)
 
-                alpha_prod_t = scheduler.alphas_cumprod[t]
-                beta_prod_t = 1 - alpha_prod_t
-                noise_pred = (latents_noisy - latent_clean_pred * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
+            alpha_prod_t = scheduler.alphas_cumprod[t]
+            beta_prod_t = 1 - alpha_prod_t
+            noise_pred = (latents_noisy - latent_clean_pred * (alpha_prod_t ** (0.5))) / (beta_prod_t ** (0.5))
 
             if loss_coefficients == 'z':
                 x_t_prev = scheduler.add_noise(latent, noise_t_prev, t_prev)
@@ -382,17 +338,15 @@ class PDS(object):
                 zt = (x_t_prev - mu) / sigma_t
             else:
                 x_coeff, eps_coeff = loss_coefficients
-                zt = x_coeff * x_x0 + eps_coeff * noise_pred
-                # zt = x_coeff * x_x0 + eps_coeff * noise_pred * w_eps
+                zt = x_coeff * latent + eps_coeff * noise_pred
             zts[name] = zt
 
         grad = zts["tgt"] - zts["src"]
         grad = torch.nan_to_num(grad)
         target = (tgt_x0 - grad).detach()
         loss = 0.5 * F.mse_loss(tgt_x0, target, reduction=reduction) / batch_size
-
         if return_dict:
-            dic = {"loss": loss, "grad": grad, "t": t, "src_x0": src_x0, "target": target}
+            dic = {"loss": loss, "grad": grad, "t": t, "src_x0": src_x0}
             return dic
         else:
             return loss
@@ -556,12 +510,11 @@ class PDS(object):
         batch_size = im.shape[0]
         t, t_prev = self.pds_timestep_sampling(batch_size, sample=t_sample)
 
-        if noise is None:
-            noise = torch.randn_like(im)
-
-        # x_t
         if latents_noisy is None:
+            noise = torch.randn_like(im) if noise is None else noise
+            # x_t
             latents_noisy = scheduler.add_noise(im, noise, t)
+        # latents_noisy = noise
         latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
         text_embeddings = torch.cat([src_text_embedding, uncond_embedding], dim=0)
         noise_pred = self.unet.forward(
@@ -588,18 +541,20 @@ class PDS(object):
 
         alpha_prod_t_prev = scheduler.alphas_cumprod[t_prev].to(device)
         w = ((1 - alpha_prod_t_prev) / alpha_prod_t_prev) ** 0.5
+        # w = 1 / alpha_prod_t_prev ** 0.5
 
         grad = w * (noise_pred_prev - noise_pred)
         grad = torch.nan_to_num(grad)
         target = (im - grad).detach()
         loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size
         if return_dict:
-            dic = {"loss": loss, "grad": grad, "t": t, "target": target, "noise_pred": noise_pred, "noise_pred_prev": noise_pred_prev, "latents_noisy_prev": latents_noisy_prev, "x_0_hat_pred": x_0_hat_pred}
+            dic = {"loss": loss, "grad": grad, "t": t, "target": target, "latents_noisy_prev": latents_noisy_prev,
+                    "x_0_hat_pred": x_0_hat_pred, "noise_pred": noise_pred, "noise_pred_prev": noise_pred_prev}
             return dic
         else:
             return loss
 
-    def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0, noise_sample=None):
+    def run_sdedit(self, x0, tgt_prompt=None, num_inference_steps=20, skip=7, eta=0):
         scheduler = self.scheduler
         scheduler.set_timesteps(num_inference_steps)
         timesteps = scheduler.timesteps
@@ -607,7 +562,7 @@ class PDS(object):
 
         S = num_inference_steps - skip
         t = reversed_timesteps[S - 1]
-        noise = torch.randn_like(x0) if noise_sample is None else noise_sample
+        noise = torch.randn_like(x0)
 
         xt = scheduler.add_noise(x0, noise, t)
 
@@ -659,7 +614,7 @@ class PDS(object):
         if percentile_clip:
             xhat_pred = clip_image_at_percentiles(xhat_pred, 0.05, 0.95)
 
-        return xhat_pred, noise
+        return xhat_pred
 
     def reverse_step(self, model_output, timestep, sample, eta=0, variance_noise=None, scheduler=None):
 
