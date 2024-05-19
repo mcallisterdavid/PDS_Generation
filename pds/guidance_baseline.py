@@ -10,7 +10,7 @@ from jaxtyping import Float
 from typing import Literal
 from PIL import Image
 import matplotlib.pyplot as plt
-from utils.imageutil import clip_image_at_percentiles
+# from utils.imageutil import clip_image_at_percentiles
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.models.embeddings import TimestepEmbedding
@@ -56,7 +56,7 @@ class Guidance(object):
         self.device = torch.device(config.device)
 
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
-        self.pipe.load_textual_inversion("pds_train/textual_inversion_pds/learned_embeds-steps-1500.safetensors")
+        # self.pipe.load_textual_inversion("pds_train/textual_inversion_pds/learned_embeds-steps-1500.safetensors")
 
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
         self.scheduler.set_timesteps(config.num_inference_steps)
@@ -567,6 +567,7 @@ class Guidance(object):
 
         w = 1 - scheduler.alphas_cumprod[t].to(device)
         grad = w * (noise_pred - noise)
+        # grad = w * cfg_scale * (noise_pred_text - noise_pred_uncond)
         grad = torch.nan_to_num(grad)
         target = (im - grad).detach()
         loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size
@@ -938,6 +939,7 @@ class Guidance(object):
 
         w = (1 - scheduler.alphas_cumprod[t.cpu()]).view(-1, 1, 1, 1).to(device)
         grad = w * (noise_pred_pretrain - noise_pred_est)
+        # grad = w * (noise_pred_est - noise_pred_pretrain_uncond)
 
         grad = torch.nan_to_num(grad)
         target = (im - grad).detach()

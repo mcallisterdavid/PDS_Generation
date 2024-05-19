@@ -61,12 +61,12 @@ guidance = Guidance(GuidanceConfig(
 if init_image_fn is not None:
     reference = torch.tensor(plt.imread(init_image_fn))[..., :3]
     reference = reference.permute(2, 0, 1)[None, ...]
-    reference = reference.to(guidance.unet.device)
-
+    reference = reference.to(guidance.unet.device) / 255.
     reference_latent = guidance.encode_image(reference)
     im = reference_latent
 else:
-    im = torch.zeros((1, 4, 64, 64), device=guidance.unet.device)
+    # im = torch.zeros((1, 4, 64, 64), device=guidance.unet.device)
+    im = torch.randn((1, 4, 64, 64), device=guidance.unet.device)
 
 date = datetime.now().strftime("%m-%d")
 src_method = args.src_method if 'pds' in args.mode else ''
