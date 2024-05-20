@@ -387,7 +387,7 @@ class PDS(object):
                 zt = (x_t_prev - mu) / sigma_t
             else:
                 x_coeff, eps_coeff = loss_coefficients
-                zt = x_coeff * x_x0 + eps_coeff * noise_pred
+                zt = x_coeff * x_x0 + eps_coeff * noise_pred * cfg_scale
             zts[name] = zt
 
         grad = zts["tgt"] - zts["src"]

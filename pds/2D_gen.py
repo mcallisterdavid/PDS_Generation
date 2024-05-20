@@ -44,14 +44,12 @@ class PDSGenerationConfig():
         mode='schedule',
         # value_initial=0.01,
         value_initial=0.016,
-        value_final=0.002,
+        value_final=0.0034,
         warmup_steps=600,
         num_steps=800,
     )
-    loss_coefficients: Union[Tuple[float, float], Literal['z']] = (4, 0) # Set coefficients for x and eps terms, alternatively use z weighting
-    # loss_coefficients: Union[Tuple[float, float], Literal['z']] = (0.1, 1) # Set coefficients for x and eps terms, alternatively use z weighting
+    loss_coefficients: Union[Tuple[float, float], Literal['z']] = (0.2, 1) # Set coefficients for x and eps terms, alternatively use z weighting
     n_steps: int = 2000
-    # n_steps: int = 3000
     seed: int = 48
     optimize_canvas: bool = False
     fixed_noise_sample: bool = False
@@ -70,12 +68,12 @@ class PDSGenerationConfig():
     project_cfg: SimpleScheduleConfig = SimpleScheduleConfig(
         mode='schedule',
         # value_initial=100,
-        value_initial=30,
+        value_initial=25,
         value_final=7.5,
         warmup_steps=600,
         num_steps=800,
     )
-    pds_cfg: float = 50
+    pds_cfg: float = 35
     project_x_loss: bool = True
     project_eps_loss: bool = False
     pds_t_schedule: TimestepScheduleConfig = TimestepScheduleConfig(
