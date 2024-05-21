@@ -35,7 +35,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--src_prompt', type=str, default='pixelated, foggy, hazy, blurry, noisy, malformed')
 parser.add_argument('--tgt_prompt', type=str, default='detailed, high resolution, high quality, sharp')
 parser.add_argument('--init_image_fn', type=str, default=None)
-parser.add_argument('--mode', type=str, default='pds', choices=['pds', 'sds', 'nfsd', 'pds_exp', 'vsd', 'apfo', 'xds2'])
+parser.add_argument('--init_image_method', type=str, default='zero')
+parser.add_argument('--mode', type=str, default='pds', choices=['pds', 'sds', 'nfsd', 'pds_exp', 'vsd', 'apfo', 'xds2', 'sds++'])
 parser.add_argument('--src_method', type=str, default='step', choices=['sdedit', 'step', 'copy', 'ddpm'])
 parser.add_argument('--grad_method', type=str, default='z')
 parser.add_argument('--cfg_scale', type=float, default=100)
@@ -59,10 +60,11 @@ guidance = Guidance(GuidanceConfig(
 dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/train2017', json='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', vocab=None)
 
 date = datetime.now().strftime("%m-%d")
+# date = '05-18'
 src_method = args.src_method if 'pds' in args.mode else ''
 grad_method = args.grad_method if 'pds' in args.mode else ''
-save_dir = 'results/eval/%s/%s_gen_%s/lr%.3f_seed%d_scale%.1f' % (date, args.mode, src_method+'_'+grad_method,
-            args.lr, args.seed, args.cfg_scale)
+save_dir = 'results/eval/%s/%s_gen_%s/lr%.3f_seed%d_scale%.1f_%s' % (date, args.mode, src_method+'_'+grad_method,
+            args.lr, args.seed, args.cfg_scale, args.init_image_method)
 os.makedirs(save_dir, exist_ok=True)
 print('Save dir:', save_dir)
 
@@ -84,8 +86,12 @@ n_samples = 5000
 
 for i in range(args.shard_id*100, (args.shard_id+1)*100):
     ref_im, prompt = dataset.__getitem__(i)
-    im = torch.zeros((1, 4, 64, 64), device=guidance.unet.device)
-    # im = torch.randn((1, 4, 64, 64), device=guidance.unet.device)
+    if args.init_image_method == 'zero':
+        im = torch.zeros((1, 4, 64, 64), device=guidance.unet.device)
+    elif args.init_image_method == 'rand':
+        im = torch.randn((1, 4, 64, 64), device=guidance.unet.device)
+    if args.mode == 'sds++':
+        im = guidance.pipe(prompt="", guidance_scale=0, num_inference_steps=20, output_type='latent')[0]
     im.requires_grad_(True)
     im.retain_grad()
     noise = None
@@ -125,6 +131,14 @@ for i in range(args.shard_id*100, (args.shard_id+1)*100):
                 return_dict=True
             )
         elif args.mode == 'sds':
+            pds_dict = guidance.sds_loss(
+                im=im,
+                prompt=prompt,
+                cfg_scale=args.cfg_scale,
+                noise=noise,
+                return_dict=True
+            )
+        elif args.mode == 'sds++':
             pds_dict = guidance.sds_loss(
                 im=im,
                 prompt=prompt,

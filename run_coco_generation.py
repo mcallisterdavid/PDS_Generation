@@ -9,7 +9,10 @@ commands = []
 # Loop through each line in the file
 for shard_id in range(1, 50):
     # Create the command with the extracted filename
-    command = f'python3 baseline_run_coco.py --mode vsd --cfg_scale 7.5  --n_step 1000  --seed 0 --shard_id {shard_id}'
+    # command = f'python3 baseline_run_coco.py --mode vsd --cfg_scale 7.5  --n_step 1000  --seed 0 --shard_id {shard_id}'
+    # command = f'python3 baseline_run_coco.py --mode sds --cfg_scale 100  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
+    # command = f'python3 baseline_run_coco.py --mode nfsd --cfg_scale 7.5  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
+    command = f'python3 baseline_run_coco.py --mode sds++ --cfg_scale 100  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
     
     JNAME = f"{shard_id}_2d_generation"
     SCRIPT = f"{current_path}/slurm/temp/run.{JNAME}.sh"
@@ -42,12 +45,12 @@ for shard_id in range(1, 50):
         slurm_file.write(
             f"#SBATCH --error=/fs/vulcan-projects/contrastive_learning_songweig/slurm/threestudio/coco/{JNAME}.err\n"
         )
-        # slurm_file.write("#SBATCH --account=vulcan-jbhuang\n")
-        # slurm_file.write("#SBATCH --qos=vulcan-scavenger\n")
-        # slurm_file.write("#SBATCH --partition=vulcan-scavenger\n")
-        slurm_file.write("#SBATCH --account=scavenger\n")
-        slurm_file.write("#SBATCH --qos=scavenger\n")
-        slurm_file.write("#SBATCH --partition=scavenger\n")
+        slurm_file.write("#SBATCH --account=vulcan-jbhuang\n")
+        slurm_file.write("#SBATCH --qos=vulcan-scavenger\n")
+        slurm_file.write("#SBATCH --partition=vulcan-scavenger\n")
+        # slurm_file.write("#SBATCH --account=scavenger\n")
+        # slurm_file.write("#SBATCH --qos=scavenger\n")
+        # slurm_file.write("#SBATCH --partition=scavenger\n")
         slurm_file.write("#SBATCH --gres=gpu:rtxa5000:1\n")
         slurm_file.write("#SBATCH --mem=32gb\n")
         slurm_file.write("#SBATCH --time=1-00:00:00\n")
