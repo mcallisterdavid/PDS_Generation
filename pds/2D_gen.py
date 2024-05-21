@@ -43,13 +43,27 @@ class PDSGenerationConfig():
     lr: SimpleScheduleConfig = SimpleScheduleConfig(
         mode='schedule',
         # value_initial=0.01,
-        value_initial=0.016,
-        value_final=0.0034,
-        warmup_steps=600,
-        num_steps=800,
+        value_initial=0.01,
+        value_final=0.0025,
+        warmup_steps=500,
+        num_steps=501,
     )
     loss_coefficients: Union[Tuple[float, float], Literal['z']] = (0.2, 1) # Set coefficients for x and eps terms, alternatively use z weighting
-    n_steps: int = 2000
+    x_coeff: SimpleScheduleConfig = SimpleScheduleConfig(
+        mode='schedule',
+        value_initial=1,
+        value_final=0.0,
+        warmup_steps=500,
+        num_steps=501,
+    )
+    eps_coeff: SimpleScheduleConfig = SimpleScheduleConfig(
+        mode='schedule',
+        value_initial=0,
+        value_final=1.0,
+        warmup_steps=500,
+        num_steps=501,
+    )
+    n_steps: int = 2800
     seed: int = 48
     optimize_canvas: bool = False
     fixed_noise_sample: bool = False
@@ -68,12 +82,12 @@ class PDSGenerationConfig():
     project_cfg: SimpleScheduleConfig = SimpleScheduleConfig(
         mode='schedule',
         # value_initial=100,
-        value_initial=25,
+        value_initial=40,
         value_final=7.5,
-        warmup_steps=600,
-        num_steps=800,
+        warmup_steps=500,
+        num_steps=501,
     )
-    pds_cfg: float = 35
+    pds_cfg: float = 100
     project_x_loss: bool = True
     project_eps_loss: bool = False
     pds_t_schedule: TimestepScheduleConfig = TimestepScheduleConfig(
@@ -89,8 +103,8 @@ class PDSGenerationConfig():
         lower_bound = 0.1,
         upper_bound_final = 0.05,
         lower_bound_final = 0.02,
-        warmup_steps = 600,
-        num_steps = 800,
+        warmup_steps = 500,
+        num_steps = 501,
     )
 
 def validate_timestep_config(cfg: TimestepScheduleConfig):
@@ -229,6 +243,9 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
 
         with torch.no_grad():
 
+            x_coeff = sample_simple_schedule(config.x_coeff, step)
+            eps_coeff = sample_simple_schedule(config.eps_coeff, step)
+
             pds_dict = pds.pds_gen(
                 im=im_opt,
                 t_project = sample_timestep(config.project_t_schedule, step),
@@ -238,7 +255,7 @@ def training_loop(config: PDSGenerationConfig, save_dir: str):
                 extra_tgt_prompts=config.extra_tgt_prompts,
                 thresholding=config.thresholding,
                 dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
-                loss_coefficients=config.loss_coefficients,
+                loss_coefficients=(x_coeff, eps_coeff),
                 project_x_loss=config.project_x_loss,
                 project_eps_loss=config.project_eps_loss,
                 project_cfg_scale=sample_simple_schedule(config.project_cfg, step),

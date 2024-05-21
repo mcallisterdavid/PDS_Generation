@@ -313,6 +313,7 @@ class PDS(object):
 
         device = self.device
         scheduler = self.scheduler
+        x_coeff, eps_coeff = loss_coefficients
 
         # process text.
         self.update_text_features(tgt_prompt=prompt + extra_tgt_prompts, src_prompt=prompt + extra_src_prompts)
@@ -324,26 +325,29 @@ class PDS(object):
         batch_size = im.shape[0]
         project_from = im if project_from is None else project_from
 
-        if source_im is not None:
-            src_x0 = source_im
-        elif src_method == "sdedit":
-            src_x0 = self.run_sdedit(
-                x0=project_from,
-                tgt_prompt=prompt,
-                num_inference_steps=num_solve_steps,
-                skip=int((1 - t_project) * num_solve_steps),
-                noise_sample=project_noise_sample,
-            )
-        elif src_method == "step":
+        if x_coeff < 1e-4:
+            src_x0 = project_from
+        else:
+            if source_im is not None:
+                src_x0 = source_im
+            elif src_method == "sdedit":
+                src_x0 = self.run_sdedit(
+                    x0=project_from,
+                    tgt_prompt=prompt,
+                    num_inference_steps=num_solve_steps,
+                    skip=int((1 - t_project) * num_solve_steps),
+                    noise_sample=project_noise_sample,
+                )
+            elif src_method == "step":
 
-            projection_timestep, _ = self.pds_timestep_sampling(batch_size, sample=t_project)
-            src_x0 = self.run_single_step(
-                x0=project_from,
-                t=projection_timestep.item(),
-                tgt_prompt=prompt,
-                cfg_scale=project_cfg_scale,
-                noise_sample=project_noise_sample,
-            )
+                projection_timestep, _ = self.pds_timestep_sampling(batch_size, sample=t_project)
+                src_x0 = self.run_single_step(
+                    x0=project_from,
+                    t=projection_timestep.item(),
+                    tgt_prompt=prompt,
+                    cfg_scale=project_cfg_scale,
+                    noise_sample=project_noise_sample,
+                )
 
         t, t_prev = self.pds_timestep_sampling(batch_size, sample=t_edit)
         beta_t = scheduler.betas[t].to(device)
@@ -364,15 +368,15 @@ class PDS(object):
             eps_x0 = latent if project_eps_loss else tgt_x0
             latents_noisy = scheduler.add_noise(eps_x0, noise, t)
             latent_model_input = torch.cat([latents_noisy] * 1, dim=0)
-            # text_embeddings = torch.cat([cond_text_embedding, uncond_embedding], dim=0)
             text_embeddings = cond_text_embedding
-            noise_pred = unet.forward(
-                latent_model_input,
-                torch.cat([t] * 1).to(device),
-                encoder_hidden_states=text_embeddings,
-            ).sample
-            # noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-            # noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
+            if eps_coeff < 1e-4:
+                noise_pred = torch.zeros_like(latents_noisy)
+            else:
+                noise_pred = unet.forward(
+                    latent_model_input,
+                    torch.cat([t] * 1).to(device),
+                    encoder_hidden_states=text_embeddings,
+                ).sample
 
             scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(latents_noisy)
             latent_clean_pred = scheduler.step(noise_pred, t, latents_noisy).pred_original_sample
@@ -386,7 +390,6 @@ class PDS(object):
                 mu = self.compute_posterior_mean(latents_noisy, noise_pred, t, t_prev)
                 zt = (x_t_prev - mu) / sigma_t
             else:
-                x_coeff, eps_coeff = loss_coefficients
                 zt = x_coeff * x_x0 + eps_coeff * noise_pred * cfg_scale
             zts[name] = zt
 
