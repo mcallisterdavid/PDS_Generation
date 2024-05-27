@@ -4,7 +4,7 @@ import numpy as np
 import gc
 import torch
 import torch.nn.functional as F
-from diffusers import DDIMScheduler, DiffusionPipeline
+from diffusers import DDIMScheduler, DiffusionPipeline, DDIMInverseScheduler
 from contextlib import contextmanager
 from jaxtyping import Float
 from typing import Literal
@@ -33,7 +33,7 @@ class GuidanceConfig:
     sd_pretrained_model_or_path: str = "runwayml/stable-diffusion-v2-1-base"
     sd_pretrained_model_or_path_lora: str = "stabilityai/stable-diffusion-2-1"
 
-    num_inference_steps: int = 500
+    num_inference_steps: int = 100
     min_step_ratio: float = 0.02
     max_step_ratio: float = 0.98
 
@@ -58,7 +58,18 @@ class Guidance(object):
         self.pipe = DiffusionPipeline.from_pretrained(config.sd_pretrained_model_or_path).to(self.device)
 
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self.inverse_scheduler = DDIMInverseScheduler.from_config(self.pipe.scheduler.config)
+        self.inverse_scheduler.set_timesteps(config.num_inference_steps, device=self.device)
+
+        self.inverse_scheduler.alphas = self.inverse_scheduler.alphas.to(self.device)
+        self.inverse_scheduler.betas = self.inverse_scheduler.betas.to(self.device)
+        self.inverse_scheduler.alphas_cumprod = self.inverse_scheduler.alphas_cumprod.to(self.device)
+
         self.scheduler.set_timesteps(config.num_inference_steps)
+        self.scheduler.alphas = self.scheduler.alphas.to(self.device)
+        self.scheduler.betas = self.scheduler.betas.to(self.device)
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
+
         self.pipe.scheduler = self.scheduler
 
         self.unet = self.pipe.unet
@@ -556,11 +567,12 @@ class Guidance(object):
         latents_noisy = scheduler.add_noise(im, noise, t)
         latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
         text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding], dim=0)
-        noise_pred = self.unet.forward(
-            latent_model_input,
-            torch.cat([t] * 2).to(device),
-            encoder_hidden_states=text_embeddings,
-        ).sample
+        with torch.no_grad():
+            noise_pred = self.unet.forward(
+                latent_model_input,
+                torch.cat([t] * 2).to(device),
+                encoder_hidden_states=text_embeddings,
+            ).sample
         noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_text - noise_pred_uncond)
 
@@ -851,6 +863,187 @@ class Guidance(object):
             return dic
         else:
             return loss
+
+    def vsd_inv_loss(
+        self,
+        im,
+        inversion_network: Literal['lora', 'unconditional'] = 'lora',
+        prompt=None,
+        max_t=0.981,
+        min_t=0.02,
+        reduction="mean",
+        cfg_scale=100,
+        return_dict=False,
+    ):
+        device = self.device
+        scheduler = self.scheduler
+
+        # process text.
+        self.update_text_features(
+            tgt_prompt=prompt,
+            src_prompt=prompt + ', oversaturated, smooth, pixelated, cartoon, foggy, hazy, blurry, bad structure, noisy, malformed'
+        )
+        src_text_embedding = self.src_text_feature
+        tgt_text_embedding = self.tgt_text_feature
+        uncond_embedding = self.null_text_feature
+
+        batch_size = im.shape[0]
+        camera_condition = torch.zeros([batch_size, 4, 4], device=device)
+
+        with torch.no_grad():
+            # random timestamp
+            t = torch.randint(
+                int(min_t * 1000),
+                int(max_t * 1000),
+                [batch_size],
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            noise = torch.randn_like(im)
+
+            latents_noisy = scheduler.add_noise(im, noise, t)
+            latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+            text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding], dim=0)
+            with self.disable_unet_class_embedding(self.unet) as unet:
+                cross_attention_kwargs = {"scale": 0.0} if self.single_model else None
+                noise_pred_pretrain = unet.forward(
+                    latent_model_input,
+                    torch.cat([t] * 2).to(device),
+                    encoder_hidden_states=text_embeddings,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
+
+            inv_latents = im
+            inverse_timesteps = self.inverse_scheduler.timesteps
+
+            # invert unconditionally for now
+            for inv_t in inverse_timesteps:
+                inv_t = t * 0 + inv_t
+
+                # Random sample maximum timestep
+                if inv_t > t:
+                    continue
+
+                inv_model_input = inv_latents
+                inv_model_input = self.inverse_scheduler.scale_model_input(inv_model_input, inv_t)
+
+                if inversion_network == 'lora':
+                    noise_pred_inv = self.unet_lora.forward(
+                        inv_model_input,
+                        torch.cat([inv_t] * 1).to(device),
+                        encoder_hidden_states=torch.cat([tgt_text_embedding] * 1),
+                        class_labels=torch.cat(
+                            [camera_condition.view(batch_size, -1)],
+                            dim=0,
+                        ),
+                        cross_attention_kwargs={"scale": 1.0},
+                    ).sample
+
+                    alphas_cumprod = self.scheduler_lora.alphas_cumprod.to(
+                        device=latents_noisy.device, dtype=latents_noisy.dtype
+                    )
+                    alpha_t = alphas_cumprod[inv_t] ** 0.5
+                    sigma_t = (1 - alphas_cumprod[inv_t]) ** 0.5
+
+                    noise_pred_inv = inv_model_input * torch.cat([sigma_t] * 1, dim=0).view(
+                        -1, 1, 1, 1
+                    ) + noise_pred_inv * torch.cat([alpha_t] * 1, dim=0).view(-1, 1, 1, 1)
+
+                elif inversion_network == 'unconditional':
+                    with self.disable_unet_class_embedding(self.unet) as unet:
+                        cross_attention_kwargs = {"scale": 0.0} if self.single_model else None
+                        # text_embeddings_inv = torch.cat([uncond_embedding], dim=0)
+                        text_embeddings_inv = torch.cat([src_text_embedding], dim=0)
+                        noise_pred_inv = unet.forward(
+                            inv_model_input,
+                            torch.cat([inv_t] * 1).to(device),
+                            encoder_hidden_states=text_embeddings_inv,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                        ).sample
+                else:
+                    raise ValueError(inversion_network)
+
+                inv_latents = self.inverse_scheduler.step(noise_pred_inv, inv_t.cpu(), inv_latents, return_dict=False)[0]
+
+            # decode with target prompt
+            timesteps = self.scheduler.timesteps
+            forward_latents = inv_latents.clone()
+            for forward_t in timesteps:
+
+                if forward_t > t:
+                    continue
+
+                forward_t = t * 0 + forward_t # Bad style, puts it in the right format
+
+                forward_model_input = forward_latents
+                forward_model_input = self.scheduler.scale_model_input(forward_model_input, forward_t)
+
+                with self.disable_unet_class_embedding(self.unet) as unet:
+
+                    cross_attention_kwargs = {"scale": 0.0} if self.single_model else None
+                    text_embeddings_forward = torch.cat([tgt_text_embedding], dim=0)
+                    noise_pred_forward = unet.forward(
+                        forward_model_input,
+                        torch.cat([forward_t] * 1).to(device),
+                        encoder_hidden_states=text_embeddings_forward,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                    ).sample
+
+                forward_latents = self.scheduler.step(noise_pred_forward, forward_t.cpu(), forward_latents, return_dict=False)[0]
+
+            # Debugging
+            # def decode_latent(latent):
+            #     latent = latent.detach().to(device)
+            #     with torch.no_grad():
+            #         rgb = self.decode_latent(latent)
+            #     rgb = rgb.float().cpu().permute(0, 2, 3, 1)
+            #     rgb = rgb.permute(1, 0, 2, 3)
+            #     rgb = rgb.flatten(start_dim=1, end_dim=2)
+            #     return rgb
+
+            # decoded_bridged = decode_latent(forward_latents).cpu().numpy()
+            # plt.imsave('./debug_bridge.png', decoded_bridged)
+
+        w = (1 - scheduler.alphas_cumprod[t.cpu()]).view(-1, 1, 1, 1).to(device)
+
+        grad = w * (im - forward_latents)
+
+        grad = torch.nan_to_num(grad)
+        target = (im - grad).detach()
+        loss = 0.5 * F.mse_loss(im, target, reduction=reduction) / batch_size
+        loss_lora = self.train_lora(im, text_embeddings, camera_condition)
+        if return_dict:
+            dic = {"loss": loss, "lora_loss": loss_lora, "grad": grad, "t": t}
+            return dic
+        else:
+            return loss
+
+    def lora_loss(
+        self,
+        im,
+        prompt = None,
+        return_dict = False,
+    ):
+
+        device = self.device
+
+        # process text.
+        self.update_text_features(tgt_prompt=prompt)
+        tgt_text_embedding = self.tgt_text_feature
+        uncond_embedding = self.null_text_feature
+
+        batch_size = im.shape[0]
+        camera_condition = torch.zeros([batch_size, 4, 4], device=device)
+        text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding], dim=0)
+
+        loss_lora = self.train_lora(im, text_embeddings, camera_condition)
+
+        if return_dict:
+            dic = {"loss": loss_lora}
+            return dic
+        else:
+            return loss_lora
 
     def train_lora(
         self,

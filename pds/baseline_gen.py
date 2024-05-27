@@ -34,7 +34,7 @@ parser.add_argument('--prompt', type=str, default='a DSLR photo of a dog in a wi
 parser.add_argument('--src_prompt', type=str, default='pixelated, foggy, hazy, blurry, noisy, malformed')
 parser.add_argument('--tgt_prompt', type=str, default='detailed, high resolution, high quality, sharp')
 parser.add_argument('--init_image_fn', type=str, default=None)
-parser.add_argument('--mode', type=str, default='pds', choices=['pds', 'sds', 'nfsd', 'pds_exp', 'vsd'])
+parser.add_argument('--mode', type=str, default='pds', choices=['pds', 'sds', 'nfsd', 'pds_exp', 'vsd', 'vsd_inv'])
 parser.add_argument('--src_method', type=str, default='step', choices=['sdedit', 'step', 'copy', 'ddpm'])
 # parser.add_argument('--grad_method', type=str, default='z', choices=['eps', 'xps', 'x', 'z', 'iid_z', 'iid_eps', 'iid_xps', 'ood_z', 'ood_eps', 'ood_xps', 'condonly'])
 parser.add_argument('--grad_method', type=str, default='z')
@@ -44,14 +44,17 @@ parser.add_argument('--num_solve_steps', type=int, default=32)
 parser.add_argument('--guidance_scale', type=float, default=100)
 parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--n_steps', type=int, default=3000)
+parser.add_argument('--n_steps', type=int, default=401)
+parser.add_argument('--lora_lr', type=float, default=3e-8)
+parser.add_argument('--lora_lr_final', type=float, default=1e-5)
+parser.add_argument('--lora_lr_warmup', type=int, default=10)
 args = parser.parse_args()
 
 init_image_fn = args.init_image_fn
 
 guidance = Guidance(GuidanceConfig(
     sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base'
-), use_lora=args.mode == 'vsd')
+), use_lora=args.mode == 'vsd' or args.mode == 'vsd_inv')
 
 # Blur logic
 # kernel_size = 10
@@ -66,7 +69,7 @@ if init_image_fn is not None:
     reference_latent = guidance.encode_image(reference)
     im = reference_latent
 else:
-    im = torch.randn((1, 4, 64, 64), device=guidance.unet.device)
+    im = torch.randn((1, 4, 64, 64), device=guidance.unet.device) * 0.0
 
 src_method = args.src_method if 'pds' in args.mode else ''
 grad_method = args.grad_method if 'pds' in args.mode else ''
@@ -95,10 +98,10 @@ im.retain_grad()
 noise = None
 
 im_optimizer = torch.optim.AdamW([im], lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
-if args.mode == 'vsd':
+if args.mode == 'vsd' or args.mode == 'vsd_inv':
     lora_optimizer = torch.optim.AdamW(
         [
-            {"params": guidance.unet_lora.parameters(), "lr": 3e-4},
+            {"params": guidance.unet_lora.parameters(), "lr": args.lora_lr},
         ],
         weight_decay=0,
     )
@@ -168,6 +171,41 @@ for step in tqdm(range(args.n_steps)):
         lora_loss.backward()
         lora_optimizer.step()
         lora_optimizer.zero_grad()
+
+    elif args.mode == 'vsd_inv':
+
+        vsd_steps = 300
+
+        if step < vsd_steps:
+            pds_dict = guidance.vsd_loss(
+                im=im,
+                prompt=args.prompt,
+                cfg_scale=7.5,
+                return_dict=True
+            )
+            lora_loss = pds_dict['lora_loss']
+
+        else:
+            pds_dict = guidance.vsd_inv_loss(
+                im=im,
+                inversion_network = 'lora',
+                max_t=max(0.98 - (step - vsd_steps) / 100, 0.002),
+                min_t=max(0.9 - (step - vsd_steps) / 100, 0),
+                prompt=args.prompt,
+                cfg_scale=7.5,
+                return_dict=True
+            )
+            lora_loss = pds_dict['lora_loss']
+
+        lora_loss.backward()
+        lora_optimizer.step()
+        lora_optimizer.zero_grad()
+
+        lora_lr_init, lora_lr_final = args.lora_lr, args.lora_lr_final
+        current_lora_lr  = lora_lr_init + (lora_lr_final - lora_lr_init) * min(1, step / args.lora_lr_warmup)
+
+        for param_group in lora_optimizer.param_groups:
+            param_group['lr'] = current_lora_lr
 
     # import ipdb; ipdb.set_trace()
     grad = pds_dict['grad']
