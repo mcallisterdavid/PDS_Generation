@@ -34,27 +34,39 @@ for fn in os.listdir(base_path):
 print('The average clip score and std for folder', base_path)
 print('scores %.2f\pm%.2f'%(np.mean(clip_scores), np.std(clip_scores)))
 
+from cleanfid import fid
+# score = fid.compute_fid('results/eval/05-19/vsd_gen__/lr0.010_seed0_scale7.5', 'results/eval/real')
+score = fid.compute_fid('results/eval/05-19/vsd_gen__/lr0.010_seed0_scale7.5', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+# print('vsd fid', score) # vsd fid 65.76529093923341
+print('vsd clip fid', score) # vsd clip fid 20.50432097705861
+# score = fid.compute_fid('results/eval/05-18/sds_gen__/lr0.100_seed0_scale100.0', 'results/eval/real')
+score = fid.compute_fid('results/eval/05-18/sds_gen__/lr0.100_seed0_scale100.0', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+# print('sds fid', score) # sds fid 79.95757698810667
+print('sds clip fid', score) # sds clip fid 27.90741242730921
+# score = fid.compute_fid('results/eval/05-18/nfsd_gen__/lr0.100_seed0_scale7.5', 'results/eval/real')
+score = fid.compute_fid('results/eval/05-18/nfsd_gen__/lr0.100_seed0_scale7.5', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+# print('nfsd fid', score) # nfsd fid 79.68118533402685
+print('nfsd clip fid', score) # nfsd clip fid 27.579900820536338
+# score = fid.compute_fid('results/eval/05-18/sds++_gen__/lr0.100_seed0_scale100.0', 'results/eval/real')
+score = fid.compute_fid('results/eval/05-18/sds++_gen__/lr0.100_seed0_scale100.0', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+# print('sds fid', score) # sds fid 77.25809794821657
+print('sds clip fid', score) # sds clip fid 27.630883496976082
+# score = fid.compute_fid('results/eval/05-21/sd_sds_gen_step/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.010_seed48/', 'results/eval/real')
+score = fid.compute_fid('results/eval/05-21/sd_sds_gen_step/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.010_seed48/', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+# print('ours fid', score) # ours fid 69.82971962872455
+print('ours clip fid', score) # ours clip fid 21.56211584094494
+
+score = fid.compute_fid('results/eval/05-21/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real')
+print('ddim fid', score) # ddim fid 47.596365331
+score = fid.compute_fid('results/eval/05-21/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+print('ddim clip fid', score) # ddim clip fid 16.518581578872684
+
+score = fid.compute_fid('results/eval/05-22/sd_csd_gen_step/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.010_seed48/', 'results/eval/real')
+score = fid.compute_fid('results/eval/05-22/sd_sds_gen_step/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.010_seed48/1500/', 'results/eval/real')
+print('csd fid', score) # csd fid 47.596365331
+score = fid.compute_fid('results/eval/05-22/sd_csd_gen_step/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.010_seed48/', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
+print('csd clip fid', score) # csd clip fid 16.518581578872684
 
 
-# ViT-B/32
-# The average clip score and std for method Ours
-# Average: 0.30890963115389386
-# The average clip score and std for method SDS
-# Average: 0.3022119431268601
-# The average clip score and std for method VSD
-# Average: 0.29536588154141863
-
-# ViT-L/14
-# The average clip score and std for method Ours
-# Average: 0.26967787969680057
-# The average clip score and std for method SDS
-# Average: 0.25994693816654263
-# The average clip score and std for method VSD
-# Average: 0.24547429160466275
-
-# The average clip score and std for method Ours
-# Average: 0.31781548394097225
-# The average clip score and std for method SDS
-# Average: 0.31178094773065484
-# The average clip score and std for method VSD
-# Average: 0.2996658567398313
+score = fid.compute_fid('results/eval/05-28/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real_val', mode="clean", model_name="clip_vit_b_32")
+score = fid.compute_fid('results/eval/05-28/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real_val', mode="clean", model_name="clip_vit_b_32")

@@ -656,17 +656,18 @@ class Guidance(object):
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             delta_C = cfg_scale * (noise_pred_text - noise_pred_uncond)
 
-        self.update_text_features(tgt_prompt='unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull, dark, low-resolution, gloomy')
-        tgt_text_embedding = self.tgt_text_feature
-        uncond_embedding = self.null_text_feature
-        with torch.no_grad():
-            text_embeddings = torch.cat([tgt_text_embedding, uncond_embedding], dim=0)
-            noise_pred = self.unet.forward(
-                latent_model_input,
-                torch.cat([t] * 2).to(device),
-                encoder_hidden_states=text_embeddings,
-            ).sample
-            noise_pred_text_neg, _ = noise_pred.chunk(2)
+        if t >= 200:
+            self.update_text_features(tgt_prompt='unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull, dark, low-resolution, gloomy')
+            tgt_text_embedding = self.tgt_text_feature
+            uncond_embedding = self.null_text_feature
+            with torch.no_grad():
+                text_embeddings = uncond_embedding
+                noise_pred = self.unet.forward(
+                    latent_model_input[:1],
+                    torch.cat([t]).to(device),
+                    encoder_hidden_states=text_embeddings,
+                ).sample
+                noise_pred_text_neg= noise_pred
 
         delta_D = noise_pred_uncond if t < 200 else (noise_pred_uncond - noise_pred_text_neg)
 

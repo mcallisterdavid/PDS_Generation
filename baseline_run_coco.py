@@ -12,6 +12,7 @@ from tqdm import tqdm
 import mediapy
 import imageio
 from pds.utils.imageutil import gaussian_blur, gaussian_kernel
+from shutil import copyfile
 
 from typing import *
 from jaxtyping import *
@@ -36,7 +37,7 @@ parser.add_argument('--src_prompt', type=str, default='pixelated, foggy, hazy, b
 parser.add_argument('--tgt_prompt', type=str, default='detailed, high resolution, high quality, sharp')
 parser.add_argument('--init_image_fn', type=str, default=None)
 parser.add_argument('--init_image_method', type=str, default='zero')
-parser.add_argument('--mode', type=str, default='pds', choices=['pds', 'sds', 'nfsd', 'pds_exp', 'vsd', 'apfo', 'xds2', 'sds++'])
+parser.add_argument('--mode', type=str, default='pds', choices=['pds', 'sds', 'nfsd', 'pds_exp', 'vsd', 'apfo', 'xds2', 'sds++', 'ddim'])
 parser.add_argument('--src_method', type=str, default='step', choices=['sdedit', 'step', 'copy', 'ddpm'])
 parser.add_argument('--grad_method', type=str, default='z')
 parser.add_argument('--cfg_scale', type=float, default=100)
@@ -57,7 +58,8 @@ guidance = Guidance(GuidanceConfig(
 ), use_lora=args.mode in ['vsd', 'apfo'])
 
 
-dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/train2017', json='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', vocab=None)
+# dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/train2017', json='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', vocab=None)
+dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/val2017', json='/fs/vulcan-datasets/coco/annotations/captions_val2017.json', vocab=None)
 
 date = datetime.now().strftime("%m-%d")
 # date = '05-18'
@@ -67,6 +69,8 @@ save_dir = 'results/eval/%s/%s_gen_%s/lr%.3f_seed%d_scale%.1f_%s' % (date, args.
             args.lr, args.seed, args.cfg_scale, args.init_image_method)
 os.makedirs(save_dir, exist_ok=True)
 print('Save dir:', save_dir)
+
+save_real_images = True
 
 seed_everything(args.seed)
 
@@ -84,8 +88,16 @@ def decode_latent(latent):
 batch_size = 1
 n_samples = 5000
 
-for i in range(args.shard_id*100, (args.shard_id+1)*100):
-    ref_im, prompt = dataset.__getitem__(i)
+# for i in range(args.shard_id*100, (args.shard_id+1)*100):
+for i in range(5000):
+    ref_im, prompt, im_path = dataset.__getitem__(i)
+    if save_real_images:
+        copyfile(im_path, os.path.join('./results/eval/real_val', f'{prompt.replace("/", "_").replace(" ", "_")}_real.jpg'))
+        continue
+    if args.mode == 'ddim':
+        im = guidance.pipe(prompt=prompt, guidance_scale=7.5, num_inference_steps=20)[0]
+        plt.imsave(os.path.join(save_dir ,f'{prompt.replace("/", "_").replace(" ", "_")}_ours.jpg'), np.array(im[0])/255.)
+        continue
     if args.init_image_method == 'zero':
         im = torch.zeros((1, 4, 64, 64), device=guidance.unet.device)
     elif args.init_image_method == 'rand':
@@ -100,7 +112,7 @@ for i in range(args.shard_id*100, (args.shard_id+1)*100):
     if args.mode in ['vsd', 'apfo']:
         lora_optimizer = torch.optim.AdamW(
             [
-                {"params": guidance.unet_lora.parameters(), "lr": 3e-4},
+                {"params": guidance.unet_lora.parameters(), "lr": 1e-4},
             ],
             weight_decay=0,
         )

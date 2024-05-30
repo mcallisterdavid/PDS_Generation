@@ -8,16 +8,13 @@ from dataclasses import dataclass, asdict, is_dataclass
 import matplotlib.pyplot as plt
 import imageio
 from typing import Literal, Optional, Tuple, Any, Union
-from pds.utils.imageutil import permute_decoded_latent
-from pds.utils.trainutil import seed_everything
+from utils.imageutil import permute_decoded_latent
+from utils.trainutil import seed_everything
 import os
 from tqdm import tqdm
-from PIL import Image
-from datetime import datetime
 
-from pds.pds import PDS, PDSConfig
-# from pds.pds_sdxl import PDS_sdxl, PDS_sdxlConfig
-from pds_train.coco_utils import CocoDataset
+from pds import PDS, PDSConfig
+from pds_sdxl import PDS_sdxl, PDS_sdxlConfig
 
 @dataclass
 class SimpleScheduleConfig():
@@ -47,8 +44,7 @@ class PDSGenerationConfig():
         mode='schedule',
         # value_initial=0.01,
         value_initial=0.01,
-        # value_final=0.0025,
-        value_final=0.002,
+        value_final=0.0025,
         warmup_steps=500,
         num_steps=501,
     )
@@ -110,7 +106,6 @@ class PDSGenerationConfig():
         warmup_steps = 500,
         num_steps = 501,
     )
-    shard_id: int = 0
 
 def validate_timestep_config(cfg: TimestepScheduleConfig):
     if cfg.mode == 'fixed':
@@ -176,151 +171,153 @@ def sample_timestep(t_cfg: TimestepScheduleConfig, train_step: int):
 def training_loop(config: PDSGenerationConfig, save_dir: str):
 
     os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(os.path.join(save_dir, '1500'), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, '2000'), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, '2500'), exist_ok=True)
-    os.makedirs(os.path.join(save_dir, '2800'), exist_ok=True)
     seed_everything(config.seed)
 
     if config.model == 'sd':
         pds = PDS(PDSConfig(
             sd_pretrained_model_or_path='stabilityai/stable-diffusion-2-1-base',
+            texture_inversion_embedding='./pds/assets/learned_embeds-steps-1500.safetensors',
+            load_lora=config.load_lora,
+            # texture_inversion_embedding='./pds/assets/-steps-6000.bin'
         ))
         latent_dim = 64
+    else:
+        pds = PDS_sdxl(PDS_sdxlConfig(
+            sd_pretrained_model_or_path="stabilityai/stable-diffusion-xl-base-1.0"
+        ))
+        latent_dim = 128
+
+    if config.init_image_fn is not None:
+        reference = torch.tensor(plt.imread(config.init_image_fn))[..., :3]
+        reference = reference.permute(2, 0, 1)[None, ...]
+        reference = reference.to(pds.unet.device)
+
+        reference_latent = pds.encode_image(reference)
+        im = reference_latent.clone()
+    elif not config.optimize_canvas:
+        im = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device) * 0.2
+    else:
+        im = torch.randn((1, 4, int(latent_dim * 1.3), int(1.3 * latent_dim)), device=pds.unet.device)# * 0.1
+
+    noise_sample = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
+
+    # with torch.no_grad():
+    #     im = pds.run_single_step(
+    #         torch.zeros_like(im),
+    #         t=999,
+    #         cfg_scale=80,
+    #         tgt_prompt=config.prompt,
+    #     )
+
+    im.requires_grad_(True)
+    im.retain_grad()
     
-    # dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/train2017', json='/fs/vulcan-datasets/coco/annotations/captions_train2017.json', vocab=None)
-    dataset =  CocoDataset(root='/fs/vulcan-datasets/coco/images/val2017', json='/fs/vulcan-datasets/coco/annotations/captions_val2017.json', vocab=None)
-    for i in range(config.shard_id*100, (config.shard_id+1)*100):
-        print(i)
-        ref_im, prompt, _ = dataset.__getitem__(i)
 
-        if config.init_image_fn is not None:
-            reference = torch.tensor(plt.imread(config.init_image_fn))[..., :3]
-            reference = reference.permute(2, 0, 1)[None, ...]
-            reference = reference.to(pds.unet.device)
+    im_original = im.clone()
 
-            reference_latent = pds.encode_image(reference)
-            im = reference_latent.clone()
-        elif not config.optimize_canvas:
-            im = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
+    im_optimizer = torch.optim.AdamW([im], lr=config.lr.value_initial, betas=(0.9, 0.99), eps=1e-15)
+    decodes = []
+    decodes_src = []
+
+    for step in tqdm(range(config.n_steps)):
+        im_optimizer.zero_grad()
+
+        if config.optimize_canvas:
+           rand_float = torch.rand((1,)).item()
+           scale_min, scale_max = 50, 70
+           scale = int(scale_min + rand_float * (scale_max - scale_min))
+           rand_float = torch.rand((1,)).item()
+           x = (im.shape[3] - scale) * rand_float
+           x = int(x)
+           rand_float = torch.rand((1,)).item()
+           y = (im.shape[2] - scale) * rand_float
+           y = int(y)
+
+           im_opt = im[:, :, y:y+scale, x:x+scale]
+           im_opt = F.interpolate(im_opt, (latent_dim, latent_dim))
+           im_og = im_original[:, :, y:y+scale, x:x+scale]
+           im_og = F.interpolate(im_og, (latent_dim, latent_dim))
         else:
-            im = torch.randn((1, 4, int(latent_dim * 1.3), int(1.3 * latent_dim)), device=pds.unet.device)
+            im_opt = im
+            im_og = im_original
 
-        noise_sample = torch.randn((1, 4, latent_dim, latent_dim), device=pds.unet.device)
+        with torch.no_grad():
 
-        im.requires_grad_(True)
-        im.retain_grad()
+            x_coeff = sample_simple_schedule(config.x_coeff, step)
+            eps_coeff = sample_simple_schedule(config.eps_coeff, step)
 
-        im_original = im.clone()
+            pds_dict = pds.pds_gen(
+                im=im_opt,
+                t_project = sample_timestep(config.project_t_schedule, step),
+                t_edit = sample_timestep(config.pds_t_schedule, step),
+                prompt=config.prompt,
+                extra_src_prompts=config.extra_src_prompts,
+                extra_tgt_prompts=config.extra_tgt_prompts,
+                thresholding=config.thresholding,
+                dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
+                loss_coefficients=(x_coeff, eps_coeff),
+                project_x_loss=config.project_x_loss,
+                project_eps_loss=config.project_eps_loss,
+                project_cfg_scale=sample_simple_schedule(config.project_cfg, step),
+                src_cfg_scale=config.pds_cfg,
+                tgt_cfg_scale=config.pds_cfg,
+                project_noise_sample=noise_sample if config.fixed_noise_sample else None,
+                project_from=im_og if config.project_from_original else None,
+                src_method=config.src_method,
+                return_dict=True
+            )
 
-        im_optimizer = torch.optim.AdamW([im], lr=config.lr.value_initial, betas=(0.9, 0.99), eps=1e-15)
-        decodes = []
-        decodes_src = []
+        grad = pds_dict['grad']
 
-        for step in tqdm(range(config.n_steps)):
-            im_optimizer.zero_grad()
+        im_opt.backward(gradient=grad)
 
-            if config.optimize_canvas:
-                rand_float = torch.rand((1,)).item()
-                scale_min, scale_max = 50, 70
-                scale = int(scale_min + rand_float * (scale_max - scale_min))
-                rand_float = torch.rand((1,)).item()
-                x = (im.shape[3] - scale) * rand_float
-                x = int(x)
-                rand_float = torch.rand((1,)).item()
-                y = (im.shape[2] - scale) * rand_float
-                y = int(y)
+        im_optimizer.step()
 
-                im_opt = im[:, :, y:y+scale, x:x+scale]
-                im_opt = F.interpolate(im_opt, (latent_dim, latent_dim))
-                im_og = im_original[:, :, y:y+scale, x:x+scale]
-                im_og = F.interpolate(im_og, (latent_dim, latent_dim))
-            else:
-                im_opt = im
-                im_og = im_original
+        current_lr = sample_simple_schedule(config.lr, step)
+        for param_group in im_optimizer.param_groups:
+            param_group['lr'] = current_lr
 
+        if step % 50 == 0:
             with torch.no_grad():
+                decoded = permute_decoded_latent(pds.decode_latent(im)).cpu().numpy()
 
-                x_coeff = sample_simple_schedule(config.x_coeff, step)
-                eps_coeff = sample_simple_schedule(config.eps_coeff, step)
+            decodes.append(decoded)
+            plt.imsave(os.path.join(save_dir ,'pds_gen.png'), decoded)
 
-                pds_dict = pds.pds_gen(
-                    im=im_opt,
-                    t_project = sample_timestep(config.project_t_schedule, step),
-                    t_edit = sample_timestep(config.pds_t_schedule, step),
-                    prompt=prompt,
-                    extra_src_prompts=config.extra_src_prompts,
-                    extra_tgt_prompts=config.extra_tgt_prompts,
-                    thresholding=config.thresholding,
-                    dynamic_thresholding_cutoffs=config.dynamic_thresholding_cutoffs,
-                    loss_coefficients=(x_coeff, eps_coeff),
-                    project_x_loss=config.project_x_loss,
-                    project_eps_loss=config.project_eps_loss,
-                    project_cfg_scale=sample_simple_schedule(config.project_cfg, step),
-                    src_cfg_scale=config.pds_cfg,
-                    tgt_cfg_scale=config.pds_cfg,
-                    project_noise_sample=noise_sample if config.fixed_noise_sample else None,
-                    project_from=im_og if config.project_from_original else None,
-                    src_method=config.src_method,
-                    return_dict=True
-                )
+            if config.wandb_enabled:
+                wandb.log({'Learning Rate': current_lr})
+                wandb.log({"Current Target (Optim.)": wandb.Image(decoded)})
 
-            grad = pds_dict['grad']
-
-            im_opt.backward(gradient=grad)
-
-            im_optimizer.step()
-
-            if step+1 == 1500:
-                with torch.no_grad():
-                    decoded = permute_decoded_latent(pds.decode_latent(im.detach())).cpu().numpy()
-                decodes.append(decoded)
-                prompt_print = prompt.replace(' ', '_')
-                plt.imsave(os.path.join(save_dir, '1500', f'{prompt_print}_ours.jpg'), decoded)
-
-            if step+1 == 2000:
-                with torch.no_grad():
-                    decoded = permute_decoded_latent(pds.decode_latent(im.detach())).cpu().numpy()
-                decodes.append(decoded)
-                prompt_print = prompt.replace(' ', '_')
-                plt.imsave(os.path.join(save_dir, '2000', f'{prompt_print}_ours.jpg'), decoded)
-
-            if step+1 == 2500:
-                with torch.no_grad():
-                    decoded = permute_decoded_latent(pds.decode_latent(im.detach())).cpu().numpy()
-                decodes.append(decoded)
-                prompt_print = prompt.replace(' ', '_')
-                plt.imsave(os.path.join(save_dir, '2500', f'{prompt_print}_ours.jpg'), decoded)
-
-            if step+1 == 2800:
-                with torch.no_grad():
-                    decoded = permute_decoded_latent(pds.decode_latent(im.detach())).cpu().numpy()
-                decodes.append(decoded)
-                prompt_print = prompt.replace(' ', '_')
-                plt.imsave(os.path.join(save_dir, '2800', f'{prompt_print}_ours.jpg'), decoded)
-
-            current_lr = sample_simple_schedule(config.lr, step)
-            for param_group in im_optimizer.param_groups:
-                param_group['lr'] = current_lr
+        if step % 100 == 0:
+            imageio.mimwrite(os.path.join(save_dir, 'pds_cat_tgt.mp4'), np.stack(decodes).astype(np.float32)*255, fps=10, codec='libx264')
 
 
 def run_pds_gen(config: PDSGenerationConfig):
 
     config_dict = dataclass_to_dict(config)
-    date = datetime.now().strftime("%m-%d")
-    experiment_name = 'eval/%s/%s_sds_gen_%s/%s_lr%.3f_seed%d' % (
-        date,
+    experiment_name = '%s_sds_gen_%s/%s_lr%.3f_seed%d_%s' % (
         config.model,
         config.src_method,
         config.prompt.replace(' ', '_'),
         config.lr.value_initial,
-        config.seed
+        config.seed,
+        'threshold' if config.thresholding is not None else 'no_threshold'
     ) if config.experiment_name is None else config.experiment_name
+
+    if config.wandb_enabled:
+        wandb.init(
+            project="PDS-Gen",
+            name=experiment_name,
+            config=config_dict
+        )
 
     training_loop(
         config,
         save_dir = f'results/{experiment_name}'
     )
+
+    if config.wandb_enabled:
+        wandb.finish()
 
 
 if __name__ == "__main__":

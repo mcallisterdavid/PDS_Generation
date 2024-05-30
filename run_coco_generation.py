@@ -7,14 +7,17 @@ current_path = os.path.abspath(os.path.dirname(__file__))
 commands = []
 
 # Loop through each line in the file
-for shard_id in range(1, 50):
+for shard_id in range(50):
     # Create the command with the extracted filename
-    # command = f'python3 baseline_run_coco.py --mode vsd --cfg_scale 7.5  --n_step 1000  --seed 0 --shard_id {shard_id}'
-    # command = f'python3 baseline_run_coco.py --mode sds --cfg_scale 100  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
-    # command = f'python3 baseline_run_coco.py --mode nfsd --cfg_scale 7.5  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
-    command = f'python3 baseline_run_coco.py --mode sds++ --cfg_scale 100  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
+    command = f'python3 baseline_run_coco.py --mode vsd --cfg_scale 7.5  --n_step 2500  --seed 0 --shard_id {shard_id}'
+    # command = f'python3 baseline_run_coco.py --mode sds --cfg_scale 100  --n_step 2500 --lr 0.01 --seed 0 --shard_id {shard_id}'
+    # command = f'python3 baseline_run_coco.py --mode nfsd --cfg_scale 7.5  --n_step 2500 --lr 0.01 --seed 0 --shard_id {shard_id} --init_image_method rand'
+    # command = f'python3 baseline_run_coco.py --mode sds++ --cfg_scale 100  --n_step 200 --lr 0.1 --seed 0 --shard_id {shard_id}'
+    # command = f'python3 ours_run_coco.py --config.shard_id {shard_id}'
+    # command = f'python3 csd_run_coco.py --config.shard_id {shard_id}'
+    # command = f'python3 baseline_run_coco.py --mode ddim --seed 0 --shard_id {shard_id}'
     
-    JNAME = f"{shard_id}_2d_generation"
+    JNAME = f"{shard_id}_ddim20_generation"
     SCRIPT = f"{current_path}/slurm/temp/run.{JNAME}.sh"
     SLURM = f"{current_path}/slurm/temp/run.{JNAME}.slrm"
 
@@ -49,8 +52,8 @@ for shard_id in range(1, 50):
         slurm_file.write("#SBATCH --qos=vulcan-scavenger\n")
         slurm_file.write("#SBATCH --partition=vulcan-scavenger\n")
         # slurm_file.write("#SBATCH --account=scavenger\n")
-        # slurm_file.write("#SBATCH --qos=scavenger\n")
-        # slurm_file.write("#SBATCH --partition=scavenger\n")
+        #slurm_file.write("#SBATCH --qos=scavenger\n")
+        #slurm_file.write("#SBATCH --partition=scavenger\n")
         slurm_file.write("#SBATCH --gres=gpu:rtxa5000:1\n")
         slurm_file.write("#SBATCH --mem=32gb\n")
         slurm_file.write("#SBATCH --time=1-00:00:00\n")

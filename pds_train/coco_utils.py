@@ -49,7 +49,7 @@ class CocoDataset(data.Dataset):
         # caption.append(vocab('<end>'))
         # target = torch.Tensor(caption)
         # return image, target
-        return image, caption
+        return image, caption, os.path.join(self.root, path)
 
     def __len__(self):
         return len(self.ids)
