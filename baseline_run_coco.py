@@ -70,7 +70,7 @@ save_dir = 'results/eval/%s/%s_gen_%s/lr%.3f_seed%d_scale%.1f_%s' % (date, args.
 os.makedirs(save_dir, exist_ok=True)
 print('Save dir:', save_dir)
 
-save_real_images = True
+save_real_images = False
 
 seed_everything(args.seed)
 

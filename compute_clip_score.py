@@ -67,6 +67,5 @@ print('csd fid', score) # csd fid 47.596365331
 score = fid.compute_fid('results/eval/05-22/sd_csd_gen_step/a_DSLR_photo_of_a_dog_in_a_winter_wonderland_lr0.010_seed48/', 'results/eval/real', mode="clean", model_name="clip_vit_b_32")
 print('csd clip fid', score) # csd clip fid 16.518581578872684
 
-
-score = fid.compute_fid('results/eval/05-28/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real_val', mode="clean", model_name="clip_vit_b_32")
+score = fid.compute_fid('results/eval/05-28/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real_val')
 score = fid.compute_fid('results/eval/05-28/ddim_gen__/lr0.010_seed0_scale100.0_zero', 'results/eval/real_val', mode="clean", model_name="clip_vit_b_32")
