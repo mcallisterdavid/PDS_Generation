@@ -44,7 +44,7 @@ parser.add_argument('--num_solve_steps', type=int, default=32)
 parser.add_argument('--guidance_scale', type=float, default=100)
 parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--n_steps', type=int, default=401)
+parser.add_argument('--n_steps', type=int, default=801)
 parser.add_argument('--lora_lr', type=float, default=3e-8)
 parser.add_argument('--lora_lr_final', type=float, default=1e-5)
 parser.add_argument('--lora_lr_warmup', type=int, default=10)
@@ -174,7 +174,7 @@ for step in tqdm(range(args.n_steps)):
 
     elif args.mode == 'vsd_inv':
 
-        vsd_steps = 300
+        vsd_steps = 700
 
         if step < vsd_steps:
             pds_dict = guidance.vsd_loss(
